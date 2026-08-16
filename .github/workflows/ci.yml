@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust unit tests
+        run: cargo test --release --manifest-path rust/Cargo.toml
+
+      - name: Build backend (sttt.dll)
+        run: cargo build --release --manifest-path rust/Cargo.toml
+
+      - name: Deploy DLL for Python tests
+        shell: pwsh
+        run: Copy-Item rust/target/release/sttt.dll super_ttt/sttt.dll
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python deps
+        run: pip install pywebview numpy numba
+
+      - name: Python unit tests (headless)
+        run: python -m unittest tests.test_engine tests.test_ai -v
+
+      - name: Rust bridge smoke (headless)
+        run: python tests/smoke_rust_bridge.py
+
+      - name: Engine equivalence (100 games)
+        run: python tests/verify_rust_equiv.py
+        env:
+          EQUIV_GAMES: "100"

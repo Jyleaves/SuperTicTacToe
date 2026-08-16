@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>超级井字棋</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+
+  <!-- ===================== 主菜单 ===================== -->
+  <section id="screen-menu" class="screen active">
+    <div class="menu-deco" aria-hidden="true"></div>
+    <div class="menu-content">
+      <h1 class="logo">超级井字棋</h1>
+      <p class="subtitle">made by Xie Jiaye</p>
+      <div class="menu-buttons">
+        <button class="btn primary" id="btn-start">开 始</button>
+        <button class="btn primary" id="btn-settings">设 置</button>
+        <button class="btn primary" id="btn-rules">规 则</button>
+        <button class="btn danger" id="btn-exit">退 出</button>
+      </div>
+      <!-- 首次启动悬浮窗：引擎准备中（不挡点击，就绪后淡出） -->
+      <div class="engine-overlay" id="engine-overlay" hidden>
+        <div class="engine-overlay-icon">
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round">
+            <path d="M4 4l6 6M10 4l-6 6"/><path d="M14 14l6 6M20 14l-6 6"/>
+          </svg>
+        </div>
+        <div class="engine-overlay-bar"><div class="engine-overlay-fill" id="engine-overlay-fill"></div></div>
+        <div class="engine-overlay-text" id="engine-overlay-text">正在布置棋盘…</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== 设置 ===================== -->
+  <section id="screen-settings" class="screen">
+    <div class="panel">
+      <h2 class="panel-title">设置</h2>
+      <div class="setting-rows" id="setting-rows"></div>
+      <div class="panel-footer">
+        <button class="btn ghost" id="btn-settings-back">返回</button>
+        <button class="btn primary" id="btn-settings-ok">确认</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== 规则 ===================== -->
+  <section id="screen-rules" class="screen">
+    <div class="panel rules-panel">
+      <div class="rules-header">
+        <h2 class="panel-title">游戏规则</h2>
+      </div>
+      <div class="rules-body" id="rules-body"></div>
+      <div class="rules-footer">
+        <div class="page-nav">
+          <button class="icon-btn" id="btn-rule-prev" title="上一页" aria-label="上一页">
+            <svg viewBox="0 0 24 24" width="18" height="18"><path d="M15 5l-7 7 7 7" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+          <span class="page-indicator" id="rule-page-ind">1 / 2</span>
+          <button class="icon-btn" id="btn-rule-next" title="下一页" aria-label="下一页">
+            <svg viewBox="0 0 24 24" width="18" height="18"><path d="M9 5l7 7-7 7" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+        </div>
+        <button class="btn small ghost" id="btn-rule-back">返回菜单</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== 对局 ===================== -->
+  <section id="screen-game" class="screen">
+    <header class="game-header">
+      <div class="turn-card" id="turn-card">
+        <span class="turn-icon" id="turn-icon"></span>
+        <span id="turn-text">准备中…</span>
+      </div>
+      <div class="game-meta" id="game-meta"></div>
+    </header>
+    <div class="stats-bar hidden" id="stats-bar">
+      <div class="stats-seg seg-c" id="stats-c"></div>
+      <div class="stats-seg seg-t" id="stats-t"></div>
+      <div class="stats-seg seg-x" id="stats-x"></div>
+      <span class="stats-empty" id="stats-empty">暂无对局记录</span>
+    </div>
+    <div class="board-wrap">
+      <div id="board"></div>
+    </div>
+    <footer class="game-footer">
+      <div class="toolbar">
+        <div class="toolbar-left">
+          <button class="tool-btn" id="btn-in-settings" title="设置">
+            <svg viewBox="0 0 24 24" width="17" height="17"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7z" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.55-1 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34h.08a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87v.08a1.7 1.7 0 0 0 1.55 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.55 1z" fill="none" stroke="currentColor" stroke-width="1.8"/></svg>
+            <span>设置</span>
+          </button>
+          <button class="tool-btn" id="btn-in-menu" title="返回主菜单（ESC）">
+            <svg viewBox="0 0 24 24" width="17" height="17"><path d="M4 21V3l14 7-14 11z" fill="currentColor" stroke="none"/></svg>
+            <span>主菜单</span>
+          </button>
+        </div>
+        <button class="resign-btn" id="btn-resign">认 输</button>
+      </div>
+    </footer>
+    <div class="overlay hidden" id="settings-overlay">
+      <div class="modal-card">
+        <div class="modal-title">快速设置</div>
+        <div class="modal-hint">音效与胜率条即时生效 · 其余设置请返回主菜单</div>
+        <div class="setting-rows" id="in-game-setting-rows"></div>
+        <div class="end-buttons">
+          <button class="btn small ghost" id="btn-in-settings-close">关闭</button>
+        </div>
+      </div>
+    </div>
+    <div class="overlay hidden" id="confirm-overlay">
+      <div class="modal-card small">
+        <div class="modal-title" id="confirm-title">确定吗？</div>
+        <div class="end-buttons">
+          <button class="btn small ghost" id="btn-confirm-cancel">取消</button>
+          <button class="btn small danger" id="btn-confirm-yes">确定</button>
+        </div>
+      </div>
+    </div>
+    <div class="thinking hidden" id="thinking">
+      <span>AI 思考中</span>
+      <span class="dots"><i></i><i></i><i></i></span>
+    </div>
+    <div class="overlay hidden" id="end-overlay">
+      <div class="end-card">
+        <div class="end-title" id="end-title">结果</div>
+        <div class="end-subtitle hidden" id="end-subtitle"></div>
+        <div class="end-buttons">
+          <button class="btn primary small" id="btn-again">再来一局</button>
+          <button class="btn ghost small" id="btn-menu">返回主菜单</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+</div>
+<script src="mock.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

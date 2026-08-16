@@ -1,0 +1,10 @@
+[package]
+name = "sttt-app"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+serde_json = "1.0.151"
+sttt = { path = ".." }
+tao = "0.36.0"
+wry = "0.56.1"

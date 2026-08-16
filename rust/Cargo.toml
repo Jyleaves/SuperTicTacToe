@@ -1,0 +1,19 @@
+[package]
+name = "sttt"
+version = "1.0.0"
+edition = "2021"
+
+# 零外部依赖：离线可编译，无供应链风险
+[dependencies]
+
+[lib]
+name = "sttt"
+# cdylib: 供 Python(pywebview) 桥加载；rlib: 供 sttt-app(Rust 窗口) 直接链接
+crate-type = ["cdylib", "rlib"]
+
+# 压榨极限：O3 + LTO + 单代码生成单元
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"

@@ -1,0 +1,23 @@
+# Rust 构建产物
+rust/target/
+rust/app/target/
+
+# 预编译二进制（由 rust/build.cmd 产出，Release 页提供下载）
+SuperTicTacToe.exe
+super_ttt/sttt.dll
+
+# WebView2 用户数据 / 基准输出
+*.WebView2/
+bench_result.txt
+startup_result.txt
+
+# Python
+__pycache__/
+*.pyc
+*.nbc
+*.nbi
+
+# 临时
+*.profraw
+*.profdata
+pgo-data/
