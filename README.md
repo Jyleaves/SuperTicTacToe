@@ -37,7 +37,7 @@ pip install -r requirements.txt
 python main.py          # 或双击 start.bat
 ```
 
-**方式三（源码构建）**：安装 [Rust](https://rustup.rs) 后运行 `rustuild.cmd`，
+**方式三（源码构建）**：安装 [Rust](https://rustup.rs) 后运行 `rust/build.cmd`，
 产出 `SuperTicTacToe.exe` 与 `super_ttt\sttt.dll`。
 
 ## 玩法与功能
