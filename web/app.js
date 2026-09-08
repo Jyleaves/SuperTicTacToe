@@ -1,6 +1,6 @@
 /* ============================================================
    超级井字棋 · 前端逻辑
-   游戏状态全部由 Python 后端持有（pywebview js_api），
+   游戏状态由 Rust 后端持有（原生 IPC 或 pywebview 桥），
    本文件只负责：渲染、交互、动画、音效。
    （在普通浏览器中打开时使用内置 Mock 后端，便于开发调试。）
    ============================================================ */
@@ -20,6 +20,8 @@ const S = {
   lastStats: null,   // 最近一次 AI 搜索的终局分布 [圈赢, 平, 叉赢]
   game: null,      // 最近一次后端返回的状态
   pending: false,  // 等待后端响应（AI 思考中）
+  epoch: 0,       // 换局/离开/认输时使旧异步回包失效
+  screen: 'menu',
 };
 window.S = S;   // 暴露给 mock.js（仅浏览器调试用）
 
@@ -92,6 +94,15 @@ function saveSettings() {
    屏幕切换
    ============================================================ */
 function showScreen(id) {
+  if (S.screen === 'game' && id !== 'game') {
+    S.epoch++;
+    S.pending = false;
+    stopStatsPolling();
+    if (S.game && S.game.gameId !== undefined) {
+      Promise.resolve(bridge.cancel_game(S.game.gameId)).catch(console.error);
+    }
+  }
+  S.screen = id;
   document.querySelectorAll('.screen').forEach(el => el.classList.remove('active'));
   document.getElementById('screen-' + id).classList.add('active');
 }
@@ -141,7 +152,16 @@ function buildSettings(containerId, inGame) {
         seg.querySelectorAll('button').forEach(x => x.classList.remove('active'));
         b.classList.add('active');
         if (d.key === 'mode') syncAiRows(rows);
-        if (d.key === 'stats') renderStats();   // 开关即时生效
+        if (d.key === 'stats') {
+          stopStatsPolling();
+          renderStats();
+          if (S.screen === 'game' && S.game) {
+            const epoch = S.epoch;
+            Promise.resolve(bridge.set_stats_enabled(val, S.game.gameId)).then(() => {
+              if (epoch === S.epoch && S.settings.stats) pollStats();
+            }).catch(console.error);
+          }
+        }
         saveSettings();
       });
       seg.appendChild(b);
@@ -219,18 +239,23 @@ function flipRulePage(d) {
 /* ============================================================
    棋盘渲染
    ============================================================ */
+const boardCells = [], boardGrids = [];
 function buildBoard() {
+  if (boardCells.length) return;
   const board = document.getElementById('board');
   board.innerHTML = '';
   for (let sub = 0; sub < 9; sub++) {
     const g = document.createElement('div');
     g.className = 'subgrid';
     g.dataset.sub = sub;
+    boardGrids.push(g);
     for (let c = 0; c < 9; c++) {
-      const cell = document.createElement('div');
+      const cell = document.createElement('button');
+      cell.type = 'button';
       cell.className = 'cell';
       cell.dataset.sub = sub;
       cell.dataset.cell = c;
+      boardCells.push(cell);
       cell.addEventListener('click', () => onCellClick(sub, c));
       cell.addEventListener('mouseenter', () => onCellHover(sub, c, true));
       cell.addEventListener('mouseleave', () => onCellHover(sub, c, false));
@@ -248,19 +273,24 @@ function updateBoard(st) {
   const board = document.getElementById('board');
   const legal = new Set(st.moves.map(m => m[0] * 9 + m[1]));
 
-  board.querySelectorAll('.cell').forEach(cell => {
+  boardCells.forEach(cell => {
     const sub = +cell.dataset.sub, c = +cell.dataset.cell;
-    cell.className = 'cell';
+    const classes = ['cell'];
     const v = st.cells[sub][c];
-    if (v === CIRCLE) cell.classList.add('circle');
-    else if (v === CROSS) cell.classList.add('cross');
+    if (v === CIRCLE) classes.push('circle');
+    else if (v === CROSS) classes.push('cross');
     if (st.lastMove && st.lastMove[0] === sub && st.lastMove[1] === c) {
-      cell.classList.add('last');
+      classes.push('last');
     }
-    if (!st.winner && legal.has(sub * 9 + c)) cell.classList.add('playable');
+    const playable = !st.winner && myTurn(st) && legal.has(sub * 9 + c);
+    if (playable) classes.push('playable');
+    const className = classes.join(' ');
+    if (cell.className !== className) cell.className = className;
+    cell.disabled = !playable;
+    cell.setAttribute('aria-label', `大格 ${sub + 1}，小格 ${c + 1}，${v === CIRCLE ? '圈' : v === CROSS ? '叉' : '空'}`);
   });
 
-  board.querySelectorAll('.subgrid').forEach(g => {
+  boardGrids.forEach(g => {
     const sub = +g.dataset.sub;
     g.classList.remove('won-circle', 'won-cross', 'tie', 'playable', 'forced');
     const gs = st.grids[sub];
@@ -357,22 +387,36 @@ function renderStats() {
    前端轮询取最新结果——落子显示不被评估阻塞。
    后端 worker 已完成版本校验（过期丢弃），前端有值即更新。 */
 let statsPollTimer = null;
+let statsPollToken = 0;
+
+function stopStatsPolling() {
+  statsPollToken++;
+  clearTimeout(statsPollTimer);
+  statsPollTimer = null;
+}
 
 function pollStats(tries = 20, delay = 60) {
-  if (tries <= 0) return;
-  clearTimeout(statsPollTimer);
-  statsPollTimer = setTimeout(async () => {
+  stopStatsPolling();
+  if (tries <= 0 || !S.settings.stats || S.settings.mode !== 0 ||
+      S.screen !== 'game' || !S.game || S.game.winner) return;
+  const token = statsPollToken, epoch = S.epoch, gameId = S.game.gameId;
+  const current = () => token === statsPollToken && epoch === S.epoch &&
+    S.screen === 'game' && S.settings.stats && S.game && S.game.gameId === gameId;
+  const poll = async remaining => {
+    if (!current()) return;
     try {
       const r = await bridge.stats();
-      if (r.stats) {                         // 有值即显示（快速值 2 万 → 细化后更新）
+      if (!current()) return;
+      if (r.gameId === gameId && r.version === S.game.version && r.stats) {
         S.lastStats = r.stats;
         renderStats();
       }
-      if (r.busy && tries > 0) {
-        pollStats(tries - 1, 150);           // 仍在细化：继续轮询最终值
+      if (r.busy && remaining > 1) {
+        statsPollTimer = setTimeout(() => poll(remaining - 1), 150);
       }
     } catch (e) { /* 桥未就绪/对局外，忽略 */ }
-  }, delay);
+  };
+  statsPollTimer = setTimeout(() => poll(tries), delay);
 }
 
 /* ============================================================
@@ -394,7 +438,7 @@ function updateHud(st, pending) {
     text.textContent = 'AI 思考中…';
   } else if (S.settings.mode === 0) {
     const human = st.turn === humanColor();
-    icon.classList.add(human ? 'circle' : 'cross');
+    icon.classList.add(st.turn === CIRCLE ? 'circle' : 'cross');
     text.textContent = human ? '你的回合' : 'AI 的回合';
   } else {
     icon.classList.add(st.turn === CIRCLE ? 'circle' : 'cross');
@@ -475,65 +519,97 @@ function onCellHover(sub, cell, on) {
   el.classList.remove('ghost-circle', 'ghost-cross');
   if (!on) return;
   const st = S.game;
-  if (!st || st.winner || S.pending || !myTurn(st)) return;
+  if (S.screen !== 'game' || !st || st.winner || S.pending || !myTurn(st)) return;
   if (!st.moves.some(m => m[0] === sub && m[1] === cell)) return;
   el.classList.add(st.turn === CIRCLE ? 'ghost-circle' : 'ghost-cross');
 }
 
 async function onCellClick(sub, cell) {
   const st = S.game;
-  if (!st || st.winner || S.pending || !myTurn(st)) return;
+  if (S.screen !== 'game' || !st || st.winner || S.pending || !myTurn(st)) return;
   if (!st.moves.some(m => m[0] === sub && m[1] === cell)) return;
 
+  const epoch = S.epoch;
+  S.pending = true;
+  clearGameError();
   try {
     // 第一步：只落人类的子，立即返回并渲染（棋子马上出现）
-    const nst = await bridge.play(sub, cell);
+    const nst = await bridge.play(sub, cell, st.version);
+    if (epoch !== S.epoch) return;
     S.game = nst;
     updateBoard(nst);
     updateHud(nst, false);
-    if (nst.winner) { showEnd(nst.winner); return; }
+    if (nst.winner) { stopStatsPolling(); showEnd(nst.winner); return; }
     SFX.place();
     pollStats();                          // 人落子后的异步评估
     // 第二步：轮到电脑则异步思考
     if (S.settings.mode === 0 && nst.turn === aiColor()) {
-      await doAiTurn();
+      await doAiTurn(epoch);
     }
   } catch (e) {
     console.error('play failed:', e);
+    if (epoch === S.epoch) showGameError(() => onCellClick(sub, cell));
+  } finally {
+    if (epoch === S.epoch) S.pending = false;
   }
 }
 
-async function doAiTurn() {
+async function doAiTurn(epoch = S.epoch) {
+  if (epoch !== S.epoch || !S.game) return;
   S.pending = true;
+  clearGameError();
   updateHud(S.game, true);
   try {
-    const nst = await bridge.ai_move();
+    const nst = await bridge.ai_move(S.game.version);
+    if (epoch !== S.epoch) return;
     S.game = nst;
     if (nst.stats) S.lastStats = nst.stats;   // 有值才更新（评估异步，防闪空）
     updateBoard(nst);
     updateHud(nst, false);
-    if (nst.winner) { showEnd(nst.winner); return; }
+    if (nst.winner) { stopStatsPolling(); showEnd(nst.winner); return; }
     if (nst.lastMove) SFX.place();
     pollStats();                          // AI 落子后的异步评估
   } catch (e) {
     console.error('ai_move failed:', e);
+    if (epoch === S.epoch) showGameError(() => doAiTurn());
+  } finally {
+    if (epoch === S.epoch) S.pending = false;
   }
-  S.pending = false;
+}
+
+// pywebview may execute requests on different threads. Preserve creation order
+// even when the user leaves and starts again before the previous reply arrives.
+let newGameQueue = Promise.resolve();
+function requestNewGame(settings) {
+  const request = newGameQueue.catch(() => {}).then(() => bridge.new_game(settings));
+  newGameQueue = request;
+  return request;
 }
 
 async function startGame() {
+  if (S.screen === 'game' && S.pending && !S.game) return;
+  const epoch = ++S.epoch;
+  clearGameError();
+  stopStatsPolling();
   ensureAudio();
   saveSettings();
   hideEnd();
   buildBoard();
   S.game = null;
-  // 胜率条保留旧局值直到新评估完成——"直接切换"（有值→有值平滑过渡），
-  // 只有真空条（首次进入）才显示"等待评估…"并两端挤入
+  S.lastStats = null;
+  statsHadValue = false;
   S.pending = true;
   showScreen('game');
   updateHud(null, true);
   try {
-    const st = await bridge.new_game(S.settings);
+    const st = await requestNewGame({ ...S.settings });
+    if (epoch !== S.epoch) {
+      // A start request can finish after the user has already left the screen.
+      if (st && st.gameId !== undefined) {
+        await bridge.cancel_game(st.gameId);
+      }
+      return;
+    }
     S.game = st;
     if (st.stats) S.lastStats = st.stats; // 有值才更新（评估异步，保留旧值直到新评估就位）
     updateBoard(st);
@@ -541,12 +617,31 @@ async function startGame() {
     pollStats();                          // 异步评估完成时更新胜率条
     if (st.winner) { showEnd(st.winner); return; }
     if (S.settings.mode === 0 && st.turn === aiColor()) {
-      await doAiTurn();                    // 电脑先手
+      await doAiTurn(epoch);               // 电脑先手
     }
   } catch (e) {
     console.error('new_game failed:', e);
+    if (epoch === S.epoch) showGameError(startGame);
+  } finally {
+    if (epoch === S.epoch) S.pending = false;
   }
-  S.pending = false;
+}
+
+let retryGameAction = null;
+function clearGameError() {
+  retryGameAction = null;
+  document.getElementById('game-error').classList.add('hidden');
+}
+function showGameError(retry) {
+  retryGameAction = retry;
+  updateHud(S.game, false);
+  document.getElementById('game-error').classList.remove('hidden');
+}
+function retryGameRequest() {
+  if (S.pending || S.screen !== 'game') return;
+  const retry = retryGameAction;
+  clearGameError();
+  if (retry) retry();
 }
 
 /* ============================================================
@@ -580,14 +675,21 @@ function openConfirmResign() {
 
 async function onResign() {
   if (!S.game || S.game.winner) return;
+  const epoch = ++S.epoch;
+  stopStatsPolling();
+  S.pending = true;
   try {
-    const nst = await bridge.resign();
+    const nst = await bridge.resign(S.game.gameId);
+    if (epoch !== S.epoch) return;
     S.game = nst;
     updateBoard(nst);
     updateHud(nst, false);
-    showEnd(nst.winner, true);
+    if (nst.winner) showEnd(nst.winner, true);
   } catch (e) {
     console.error('resign failed:', e);
+    if (epoch === S.epoch) showGameError(onResign);
+  } finally {
+    if (epoch === S.epoch) S.pending = false;
   }
 }
 
@@ -614,6 +716,7 @@ function closeInGameSettings() {
    事件绑定
    ============================================================ */
 function bindEvents() {
+  document.getElementById('btn-retry').addEventListener('click', retryGameRequest);
   document.getElementById('btn-start').addEventListener('click', () => { ensureAudio(); SFX.click(); startGame(); });
   document.getElementById('btn-settings').addEventListener('click', () => { ensureAudio(); SFX.click(); showScreen('settings'); });
   document.getElementById('btn-rules').addEventListener('click', () => { ensureAudio(); SFX.click(); rulePage = 0; renderRules(); showScreen('rules'); });

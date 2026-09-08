@@ -11,13 +11,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from super_ttt import engine, mcts  # noqa: E402
 from super_ttt.server import rust_search  # noqa: E402
+from tests.bench_positions import positions  # noqa: E402
 
 
 def midgame():
-    g = engine.Game()
-    for mv in [(4, 4), (4, 0), (0, 0), (0, 4), (8, 8), (8, 4), (2, 2), (2, 8)]:
-        g.apply_move(*mv)
-    return g
+    return dict(positions())["midgame"]
 
 
 def bench_python(g, iters, threads):
@@ -29,16 +27,16 @@ def bench_python(g, iters, threads):
 
 
 def bench_rust(g, iters, threads):
+    t0 = time.perf_counter()
     r = rust_search(g.cells, g.grids, g.forced, g.turn, iters, threads, 1, 0.0)
-    return r["iters"] / (r["elapsed_ms"] / 1000.0)
+    return r["iters"] / (time.perf_counter() - t0)
 
 
 def main():
     mcts.warmup()
-    positions = [("开局", engine.Game()), ("中局", midgame())]
     print(f"{'局面':<4} {'线程':<3} {'迭代数':>8} {'Python':>10} {'Rust':>10} {'加速比':>7}")
     total_ratio = []
-    for name, g in positions:
+    for name, g in positions():
         for threads, iters in ((1, 30_000), (8, 240_000)):
             py = bench_python(g, iters, threads)
             rs = bench_rust(g, iters, threads)

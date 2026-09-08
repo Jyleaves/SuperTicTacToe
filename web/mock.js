@@ -58,48 +58,71 @@
   }
 
   const sleep = ms => new Promise(r => setTimeout(r, ms));
-
-  async function mockAiTurn(st) {
-    await sleep(600);
-    const moves = legalMoves(st);
-    if (moves.length) applyMove(st, ...moves[Math.floor(Math.random() * moves.length)]);
+  let current = null, settings = {}, active = false, gameId = 0, version = 0;
+  const matches = (expected, actual) => expected == null || expected === actual;
+  const aiColor = () => settings.first === 1 ? CIRCLE : CROSS;
+  function snapshot() {
+    if (!current) return null;
+    return {
+      ...current, cells: current.cells.map(row => row.slice()), grids: current.grids.slice(),
+      lastMove: current.lastMove && current.lastMove.slice(),
+      winLine: current.winLine && current.winLine.slice(),
+      moves: legalMoves(current), stats: null, gameId, version,
+    };
   }
 
   window.MockBackend = {
-    async precompile_status() {
-      return { ready: true, progress: 100 };   // Mock 无需编译
-    },
-    async new_game(settings) {
-      const st = {
+    async precompile_status() { return { ready: true, progress: 100 }; },
+    async new_game(nextSettings) {
+      settings = { ...nextSettings };
+      current = {
         cells: Array.from({ length: 9 }, () => Array(9).fill(0)),
         grids: Array(9).fill(0), forced: null, turn: CIRCLE,
         lastMove: null, winner: 0, winLine: null,
       };
-      if (settings.mode === 0 && settings.first === 1) st.turn = CROSS;
-      return st;
+      active = true; gameId++; version++;
+      return snapshot();
     },
-    async play(sub, cell) {
-      const st = window.S ? window.S.game : null;
-      if (!st || st.winner) return st;
-      if (!legalMoves(st).some(m => m[0] === sub && m[1] === cell)) return st;
-      applyMove(st, sub, cell);
-      return st;
-    },
-    async ai_move() {
-      const st = window.S ? window.S.game : null;
-      if (!st || st.winner) return st;
-      if (window.S.settings.mode === 0 && st.turn === CROSS) await mockAiTurn(st);
-      return st;
-    },
-    async resign() {
-      const st = window.S ? window.S.game : null;
-      if (st && !st.winner) {
-        const loser = window.S.settings.mode === 0 ? CIRCLE : st.turn;
-        st.winner = loser === CIRCLE ? CROSS : CIRCLE;
-        st.winLine = null;
+    async play(sub, cell, expectedVersion) {
+      if (!active || !current || current.winner || !matches(expectedVersion, version) ||
+          (settings.mode === 0 && current.turn === aiColor())) return snapshot();
+      if (legalMoves(current).some(m => m[0] === sub && m[1] === cell)) {
+        applyMove(current, sub, cell); version++;
       }
-      return st;
+      return snapshot();
     },
+    async ai_move(expectedVersion) {
+      if (!active || !current || current.winner || settings.mode !== 0 ||
+          current.turn !== aiColor() || !matches(expectedVersion, version)) return snapshot();
+      const position = current, searchVersion = version;
+      await sleep(600);
+      if (active && current === position && version === searchVersion) {
+        const moves = legalMoves(current);
+        if (moves.length) {
+          applyMove(current, ...moves[Math.floor(Math.random() * moves.length)]);
+          version++;
+        }
+      }
+      return snapshot();
+    },
+    async resign(expectedGame) {
+      if (active && current && !current.winner && matches(expectedGame, gameId)) {
+        const loser = settings.mode === 0 ? 3 - aiColor() : current.turn;
+        current.winner = 3 - loser;
+        current.winLine = null;
+        version++;
+      }
+      return snapshot();
+    },
+    async cancel_game(expectedGame) {
+      if (matches(expectedGame, gameId)) { active = false; version++; }
+      return { ok: true };
+    },
+    async set_stats_enabled(enabled, expectedGame) {
+      if (matches(expectedGame, gameId)) settings.stats = enabled;
+      return this.stats();
+    },
+    async stats() { return { stats: null, gameId, version, busy: false }; },
     exit_app() { window.close(); },
   };
 })();

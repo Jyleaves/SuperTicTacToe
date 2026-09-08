@@ -15,7 +15,7 @@ use std::cell::RefCell;
 use std::ffi::c_char;
 
 thread_local! {
-    static OUT: RefCell<String> = RefCell::new(String::new());
+    static OUT: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
 fn ret_json(mut s: String) -> *const c_char {
@@ -27,7 +27,8 @@ fn ret_json(mut s: String) -> *const c_char {
     })
 }
 
-/// FFI 保险：panic 不允许穿越 extern "C" 边界（UB）——捕获后返回错误 JSON。
+/// Catch unwinding panics at the FFI boundary. Release builds use panic=abort;
+/// invalid input must be rejected before calling code that can panic.
 fn ffi_guard(f: impl FnOnce() -> String + std::panic::UnwindSafe) -> *const c_char {
     match std::panic::catch_unwind(f) {
         Ok(s) => ret_json(s),
@@ -74,15 +75,19 @@ pub extern "C" fn sttt_new_game(
     first: *const c_char,
     goal: *const c_char,
     _sound: *const c_char,
-    _stats: *const c_char,
+    stats: *const c_char,
 ) -> *const c_char {
-    session::new_game(
+    let state = session::new_game_with_stats(
         parse_int(&cstr(mode)),
         parse_int(&cstr(difficulty)),
         parse_int(&cstr(first)),
         parse_int(&cstr(goal)),
+        !matches!(
+            cstr(stats).trim().to_ascii_lowercase().as_str(),
+            "false" | "0"
+        ),
     );
-    ffi_guard(|| session::state_json())
+    ret_json(state)
 }
 
 #[no_mangle]
@@ -111,12 +116,60 @@ pub extern "C" fn sttt_resign() -> *const c_char {
 
 #[no_mangle]
 pub extern "C" fn sttt_stats() -> *const c_char {
-    ffi_guard(|| session::stats_json())
+    ffi_guard(session::stats_json)
+}
+
+fn optional_version(value: i64) -> Option<u64> {
+    if value >= 0 {
+        Some(value as u64)
+    } else {
+        None
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn sttt_play_version(sub: i32, cell: i32, version: i64) -> *const c_char {
+    ffi_guard(|| {
+        session::play_at_version(sub, cell, optional_version(version));
+        session::state_json()
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn sttt_ai_move_version(version: i64) -> *const c_char {
+    ffi_guard(|| {
+        session::ai_move_at_version(optional_version(version));
+        session::state_json()
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn sttt_resign_game(game_id: i64) -> *const c_char {
+    ffi_guard(|| {
+        session::resign_game(optional_version(game_id));
+        session::state_json()
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn sttt_cancel_game(game_id: i64) -> *const c_char {
+    ffi_guard(|| {
+        session::cancel_game(optional_version(game_id));
+        "{\"ok\":true}".to_string()
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn sttt_set_stats_enabled(enabled: i32, game_id: i64) -> *const c_char {
+    ffi_guard(|| {
+        session::set_stats_enabled(enabled != 0, optional_version(game_id));
+        session::stats_json()
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn sttt_legal_moves() -> *const c_char {
-    ffi_guard(|| session::legal_moves_json())
+    ffi_guard(session::legal_moves_json)
 }
 
 #[no_mangle]
@@ -142,7 +195,9 @@ pub unsafe extern "C" fn sttt_search_raw(
     let cells: [u8; 81] = std::array::from_fn(|i| (*cells.add(i)).max(0) as u8);
     let grids_arr: [u8; 9] = std::array::from_fn(|i| (*grids.add(i)).max(0) as u8);
     ffi_guard(|| {
-        session::search_json(&cells, &grids_arr, forced, turn, iters, threads, goal, budget)
+        session::search_json(
+            &cells, &grids_arr, forced, turn, iters, threads, goal, budget,
+        )
     })
 }
 
@@ -191,6 +246,7 @@ mod tests {
 
     #[test]
     fn json_state_shape() {
+        let _guard = session::TEST_SESSION_LOCK.lock().unwrap();
         session::new_game(1, -1, 0, 1); // 人人模式（不触发评估线程）
         let s = session::state_json();
         assert!(s.starts_with("{\"cells\":[[0,0,0,0,0,0,0,0,0],"));
@@ -203,6 +259,7 @@ mod tests {
 
     #[test]
     fn play_and_ai_flow() {
+        let _guard = session::TEST_SESSION_LOCK.lock().unwrap();
         session::new_game(0, -1, 0, 1); // 人机：人先手（圈），AI=叉
         session::play(0, 4);
         session::ai_move();
@@ -213,6 +270,7 @@ mod tests {
 
     #[test]
     fn resign_flow() {
+        let _guard = session::TEST_SESSION_LOCK.lock().unwrap();
         session::new_game(0, -1, 0, 1);
         session::resign();
         let s = session::state_json();
@@ -222,6 +280,7 @@ mod tests {
 
     #[test]
     fn pvp_flow() {
+        let _guard = session::TEST_SESSION_LOCK.lock().unwrap();
         session::new_game(1, -1, 0, 1);
         session::play(0, 0);
         let s = session::state_json();

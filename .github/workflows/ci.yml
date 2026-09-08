@@ -8,20 +8,74 @@ on:
 env:
   PYTHONUTF8: "1"
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: windows-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          toolchain: '1.92.0'
+
+      - name: Rust formatting and lint
+        run: |
+          cargo fmt --manifest-path rust/Cargo.toml --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo fmt --manifest-path rust/app/Cargo.toml --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo clippy --release --locked --manifest-path rust/Cargo.toml -- -D warnings
 
       - name: Rust unit tests
-        run: cargo test --release --manifest-path rust/Cargo.toml
+        run: cargo test --release --locked --manifest-path rust/Cargo.toml
 
-      - name: Build backend (sttt.dll)
-        run: cargo build --release --manifest-path rust/Cargo.toml
+      - name: Software CPU fallback tests
+        run: cargo test --release --locked --features portable --manifest-path rust/Cargo.toml
+
+      - name: Build portable DLL and desktop application
+        run: .\rust\build.cmd
+
+      - name: Check release path privacy
+        shell: pwsh
+        run: |
+          foreach ($file in @('SuperTicTacToe.exe', 'super_ttt/sttt.dll')) {
+            $bytes = [IO.File]::ReadAllBytes((Resolve-Path $file))
+            foreach ($encoding in @([Text.Encoding]::UTF8, [Text.Encoding]::Unicode)) {
+              $text = $encoding.GetString($bytes)
+              foreach ($path in @($env:GITHUB_WORKSPACE, $env:USERPROFILE, $env:CARGO_HOME)) {
+                if ($path -and ($text.Contains($path) -or $text.Contains($path.Replace('\', '/')))) {
+                  throw 'Release contains a build-machine path'
+                }
+              }
+            }
+          }
+
+      - name: Check the engine linked into the desktop EXE
+        shell: pwsh
+        run: |
+          $exe = Resolve-Path rust/app/target/release/sttt-app.exe
+          $process = Start-Process -FilePath $exe -ArgumentList '--bench-engine' -WindowStyle Hidden -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Desktop engine benchmark failed" }
+          $rows = Get-Content bench_engine_result.json -Raw | ConvertFrom-Json
+          if ($rows.Count -ne 6) { throw "Expected six benchmark workloads" }
+          $rows | Format-Table
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Frontend async regression tests
+        run: node --test tests/test_frontend.cjs
 
       - name: Deploy DLL for Python tests
         shell: pwsh
@@ -36,12 +90,25 @@ jobs:
         run: pip install pywebview numpy numba
 
       - name: Python unit tests (headless)
-        run: python -m unittest tests.test_engine tests.test_ai -v
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
 
       - name: Rust bridge smoke (headless)
         run: python tests/smoke_rust_bridge.py
+
+      - name: WebView interaction smoke
+        timeout-minutes: 2
+        run: python tests/smoke_gui.py
 
       - name: Engine equivalence (100 games)
         run: python tests/verify_rust_equiv.py
         env:
           EQUIV_GAMES: "100"
+
+      - name: Upload tested Windows build
+        uses: actions/upload-artifact@v7
+        with:
+          name: SuperTicTacToe-windows-x64
+          path: |
+            rust/app/target/release/sttt-app.exe
+            rust/target/release/sttt.dll
+            bench_engine_result.json

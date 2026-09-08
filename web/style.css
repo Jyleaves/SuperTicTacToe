@@ -371,7 +371,9 @@ body {
 }
 
 /* ---- 小格 ---- */
-.cell { aspect-ratio: 1; background: var(--cell-bg); border-radius: 8px; position: relative; }
+.cell { aspect-ratio: 1; background: var(--cell-bg); border-radius: 8px; position: relative; border: 0; padding: 0; min-width: 0; }
+.cell:focus-visible { outline: 3px solid var(--primary); outline-offset: 2px; z-index: 4; }
+.game-error { display: flex; align-items: center; justify-content: center; gap: 12px; color: var(--text-2); font-size: 13px; }
 .cell.playable { cursor: pointer; transition: background .15s ease, transform .08s ease; }
 .cell.playable:hover { background: #E9EFFE; }
 .cell.playable:active { transform: scale(.90); }
@@ -510,3 +512,11 @@ body {
 .modal-title { font-size: 18px; font-weight: 700; }
 .modal-card .setting-rows { overflow-y: auto; }
 .modal-card .end-buttons { justify-content: flex-end; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

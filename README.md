@@ -3,108 +3,90 @@
 [![CI](https://github.com/Jyleaves/SuperTicTacToe/actions/workflows/ci.yml/badge.svg)](https://github.com/Jyleaves/SuperTicTacToe/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-经典超级井字棋（Ultimate Tic-Tac-Toe）桌面版：**Rust 后端 + WebView 前端**，
-单文件绿色免安装，开箱即玩。
+Windows 桌面版 Ultimate Tic-Tac-Toe。Rust 规则引擎与 MCTS AI，WebView2 界面，前端资源内嵌于可执行文件。
 
-> Ultimate Tic-Tac-Toe with a Rust engine, bitboard MCTS and a native WebView
-> shell. Single-file portable exe, no install, no runtime deps.
+## 使用
 
-## 亮点
+从 [Releases](https://github.com/Jyleaves/SuperTicTacToe/releases) 下载 `SuperTicTacToe.exe`，放到可写目录运行。
+需要 Windows x64 和 [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/#download-section)，无需安装 Python。
+WebView2 用户数据保存在应用旁的运行时数据目录；该目录不应提交到仓库。
 
-- **纯 Rust 引擎**（`rust/`，零第三方依赖）：规则引擎 + 数组池 MCTS
-  （UCB1 + SoA 位板节点池 + greedy-1 位板 rollout + 两步树复用 + 必胜手优先）
-- **单文件分发**：`SuperTicTacToe.exe` 内嵌全部前端资源，静态链接 CRT，
-  拷给别人即可运行（仅需系统自带 WebView2 运行时）
-- **快**：单树搜索约 60 万迭代/秒（对比 Python(numba) 版 2.0-2.1×），
-  大师档 25.6 万迭代 0.6s 内出招；前端桥往返延迟 0.2ms
-- **棋力有据可查**：迁移自经过对弈验证的 Python(numba) 引擎，
-  等迭代数对弈多轮持平或领先；每一轮性能优化都附消融实验
-  （含"线程数-棋力曲线"：等迭代数下强度随并行度单调下降，
-  故 AI 采用单树搜索以保住标定棋力——详见 PROGRESS.md）
-- **体验细节**：落子即时反馈、AI 思考动画、强制区域高亮、胜利连线、
-  实时胜率条（每步后台 20 万次模拟）、Web Audio 合成音效、设置持久化
+小棋盘三连即可占领对应大格，大棋盘三连获胜。落子的小格序号决定对方下一步的强制区域；目标大格已经结束时可自由落子。
 
-## 运行
+- 人机或人人对战；可选择先后手及 AI 求胜、求败目标。
+- 五档难度：幼稚 / 简单 / 中等 / 困难 / 大师，分别最多搜索 2,000 / 8,000 / 32,000 / 128,000 / 256,000 次。
+- 音效、胜率条和设置持久化；可用 Tab 与 Enter / 空格操作棋盘。
+- AI 思考时可以认输或返回菜单；关闭胜率条会取消后台评估。
+- 胜率条显示模拟终局分布，供参考，不是经过校准的真实胜率。
 
-**方式一（推荐）**：从 [Releases](../../releases) 下载 `SuperTicTacToe.exe`，
-放到任意可写目录双击。Windows 11 / 已更新的 Windows 10 开箱即用；
-缺少 WebView2 运行时时程序会弹窗指引（装 Edge 浏览器即可解决）。
+## 构建
 
-**方式二（pywebview 回退，需要 Python）**：
+安装 Rust MSVC 工具链和 Visual Studio C++ 构建工具，在仓库根目录执行：
 
-```bash
-pip install -r requirements.txt
-python main.py          # 或双击 start.bat
+```powershell
+.
+ustuild.cmd
 ```
 
-**方式三（源码构建）**：安装 [Rust](https://rustup.rs) 后运行 `rust/build.cmd`，
-产出 `SuperTicTacToe.exe` 与 `super_ttt\sttt.dll`。
+产物是根目录的 `SuperTicTacToe.exe` 和 `super_ttt/sttt.dll`。脚本固定产物目录、检查构建及复制结果，映射本机源码路径并移除调试符号；DLL 与 EXE 使用相同的 Release 配置。
+默认保留通用 CPU 基线，在支持的 x64 CPU 上运行时选择 BMI2 / POPCNT / LZCNT 加速内核。
+不要给通用发布包添加 `target-cpu=native` 或全局指令集要求。
 
-## 玩法与功能
+Python 窗口路径需要先构建 DLL，再执行：
 
-- 在小棋盘上三连即可占领对应大格，大棋盘三连获胜；
-  落子的小格序号决定对手的强制区域
-- 人机对战（五档难度：幼稚/简单/中等/困难/大师，限次迭代
-  2000/8000/32000/128000/256000）或人人对战
-- 先后手选择；AI 目标可选"赢得对局"或"输掉对局"（放水模式）
-- 音效 / 胜率条开关，设置持久化
-
-## 架构
-
-```
-SuperTicTacToe.exe      wry/tao 窗口应用（前端 web/ 内嵌，JS↔Rust 直连 IPC）
-rust/
-  src/engine.rs         规则引擎（Python 版用例全量移植）
-  src/mcts.rs           数组池 MCTS：位板 rollout / 并行搜索 / 树复用
-  src/session.rs        会话：对局状态 + 异步胜率评估 + 基准导出
-  src/lib.rs            C ABI + JSON（ctypes 桥接口）
-  app/                  窗口应用（wry/tao，前端零改动注入兼容垫片）
-super_ttt/
-  server.py             pywebview 回退路径的 ctypes 薄桥
-  engine.py/ai.py/mcts.py  迁移前 Python(numba) 实现（对弈验证基准，原样保留）
-web/                    前端：HTML/CSS/原生 JS，矢量绘制零资源
-tests/                  单元测试 / 引擎等价性 / 新旧引擎对弈 / 性能基准
+```powershell
+python -m pip install -r requirements.txt
+python main.py
 ```
 
-两条运行路径共用同一 Rust 引擎：纯 Rust 窗口（JS→ipc→Rust，0.2ms）与
-pywebview 回退（JS→Python→ctypes→Rust，1.1ms）。
-
-## 性能与验证（节选，完整数据见 PROGRESS.md）
-
-| 指标 | Python(numba) 迁移前 | Rust 迁移后 |
-|---|---|---|
-| MCTS 吞吐 · 单线程 | 238-280 千迭代/s | **484-601 千迭代/s**（2.0-2.1×） |
-| MCTS 吞吐 · 8 线程 | 1.28-1.63 百万/s | 1.9-3.7 百万/s |
-| 桥往返延迟 | 1.14 ms | **0.19 ms** |
-| 启动到内容就绪 | >1.5s + 白屏 | 约 0.95s（就绪才显示，无白屏） |
-
-验证方法论：300 局随机游走逐步比对引擎等价；新旧引擎等迭代数对弈
-（多轮 60 局，Rust 持平或领先）；等思考时间对弈；每项优化附消融
-（PGO/native/arena 子节点布局/线程数等 7 项假设中 5 项被实测否决）。
+`start.bat` 优先启动 EXE，找不到时尝试 Python 窗口。直接打开 `web/index.html` 使用简化的浏览器 Mock，仅供界面开发。
 
 ## 测试
 
-```bash
-cargo test --release --manifest-path rust/Cargo.toml   # Rust 18 项
-python -m unittest tests.test_engine tests.test_ai -v  # Python 25 项
-python tests/smoke_rust_bridge.py                      # 桥冒烟（headless）
-python tests/verify_rust_equiv.py                      # 引擎等价性（300 局）
-python tests/bench_dll.py                              # 吞吐基准
-python tests/duel_rust.py                              # 新旧引擎对弈
-python tests/duel_rust_threads.py                      # 线程数-棋力曲线
-python tests/smoke_gui.py                              # 真实窗口整机冒烟
+需要 Python 3.12、Node.js 22+ 和 Rust；以下命令均从仓库根目录运行。
+
+```powershell
+python -m pip install -r requirements.txt numpy numba
+.
+ustuild.cmd
+cargo test --release --locked --manifest-path rust/Cargo.toml
+cargo test --release --locked --features portable --manifest-path rust/Cargo.toml
+node --test tests/test_frontend.cjs
+python -m unittest discover -s tests -p 'test_*.py' -v
+python tests/smoke_rust_bridge.py
+python tests/verify_rust_equiv.py
+python tests/smoke_gui.py
 ```
 
-## 文档
+`portable` 强制执行软件回退测试。等价性脚本默认跑 300 局，逐步对比合法步、棋盘、强制区域、轮次和终局；GUI 测试会自动打开并关闭真实窗口，失败时返回非零退出码。
 
-- [PROGRESS.md](PROGRESS.md) — 完整开发/迁移/消融实验记录
-- [DEBUG_LOG.md](DEBUG_LOG.md) — 早期移植问题记录
+## 性能
 
-## 致谢
+AI 保持单树搜索与树复用；后台评估只保留最新任务，AI 选步期间暂停评估。
+模拟初始化使用 1 KiB 缺口表，节点池按工作量分配。前端复用棋盘节点，仅更新改变的棋子样式。
 
-项目从一个 pygame 单文件版本起步，先后经历
-Python 重构（pywebview + numba MCTS）与 Rust 迁移两个阶段，
-每一步的行为等价性都有对弈实验背书。
+测量条件、原项目 / 修正包 / 最终版对照与局限见 [PROGRESS.md](PROGRESS.md)。固定随机种子的结果一致性不等于棋力提升；本次没有修改搜索策略或难度档位。
+
+```powershell
+python tests/bench_dll.py
+python tests/compare_search.py old.dll new.dll --rounds 7 --cpu 0
+python tests/bench_session.py super_ttt/sttt.dll
+```
+
+最后一个脚本测量搜索期间的状态查询延迟及 Python/DLL 进程工作集。CPU 核心绑定仅用于可重复基准，不改变应用调度。
+EXE 自带 `--bench-engine`、`?bench`、`?startup` 诊断入口，分别生成引擎、桥延迟和启动计时文件；这些本地结果不纳入版本控制。
+
+## 目录
+
+| 目录 | 内容 |
+|---|---|
+| `rust/src/` | 规则、搜索、会话管理及 C ABI |
+| `rust/app/` | 原生 Windows 窗口与 IPC |
+| `super_ttt/` | Python 桥及保留的 Python 算法参照 |
+| `web/` | HTML、CSS、JavaScript 界面 |
+| `tests/` | 回归测试、共享棋谱及基准工具 |
+
+[DEBUG_LOG.md](DEBUG_LOG.md) 记录已修问题及复现入口；历史开发记录可通过 Git 历史查阅。
 
 ## License
 

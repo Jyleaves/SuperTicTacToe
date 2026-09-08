@@ -13,18 +13,34 @@
 //! - greedy-1 rollout：立即赢 → 防立即输 → 随机；decided>=7 残局回退纯随机；
 //! - 必胜手优先（仅 goal>0）；树复用两步提升；root parallelization 投票合并。
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use crate::engine::{
-    big_winner, CELL_LINES, CELL_LINE_COUNT, GRID_LINES, GRID_LINE_COUNT,
-};
+use crate::engine::{big_winner, CELL_LINES, CELL_LINE_COUNT, GRID_LINES, GRID_LINE_COUNT};
 
 pub const C_UCB: f64 = 0.8;
 pub const NODE_CAP: usize = 524_288;
 pub const BATCH: usize = 512;
 pub const MAX_ITERATIONS: u64 = 2_000_000;
 pub const RECYCLE_MARGIN: usize = 65_536;
+
+/// A newer generation cancels work at the next batch boundary.
+#[derive(Clone, Copy)]
+pub struct Cancellation<'a> {
+    pub generation: &'a AtomicU64,
+    pub expected: u64,
+}
+
+impl Cancellation<'_> {
+    pub fn is_cancelled(self) -> bool {
+        self.generation.load(Ordering::Acquire) != self.expected
+    }
+}
+
+fn cancelled(cancel: Option<Cancellation<'_>>) -> bool {
+    cancel.is_some_and(Cancellation::is_cancelled)
+}
 
 // ---------------------------------------------------------------- 位板常量
 // flat 位 i = sub*9 + cell；字 0 = 位 0..63，字 1 = 位 64..80
@@ -108,12 +124,57 @@ const fn build_open_masks() -> [(u64, u64); 512] {
 /// 位图位 s = 大格 s 未决出；自由落子的合法域一次查表即可。
 pub const OPEN_MASK: [(u64, u64); 512] = build_open_masks();
 
+// Each entry gives the missing cells of all two-in-a-row lines for one player.
+// Filtering occupied cells also removes lines blocked by the opponent.
+const fn build_gap_table() -> [u16; 512] {
+    let mut table = [0; 512];
+    let mut own = 0u16;
+    while own < 512 {
+        let mut line = 0;
+        while line < 8 {
+            let [a, b, c] = crate::engine::WIN_LINES[line];
+            let mask = (1u16 << a) | (1u16 << b) | (1u16 << c);
+            if (own & mask).count_ones() == 2 {
+                table[own as usize] |= mask & !own;
+            }
+            line += 1;
+        }
+        own += 1;
+    }
+    table
+}
+const GAP_TABLE: [u16; 512] = build_gap_table();
+
+#[inline(always)]
+fn initial_gaps(c0: u64, c1: u64, x0: u64, x1: u64, open: u16) -> (u64, u64, u64, u64) {
+    let circles = c0 as u128 | ((c1 as u128) << 64);
+    let crosses = x0 as u128 | ((x1 as u128) << 64);
+    let empty = !(circles | crosses);
+    let (mut circle_gaps, mut cross_gaps) = (0u128, 0u128);
+    let mut remaining = open;
+    while remaining != 0 {
+        let sub = remaining.trailing_zeros();
+        remaining &= remaining - 1;
+        let shift = sub * 9;
+        circle_gaps |= (GAP_TABLE[((circles >> shift) & 511) as usize] as u128) << shift;
+        cross_gaps |= (GAP_TABLE[((crosses >> shift) & 511) as usize] as u128) << shift;
+    }
+    circle_gaps &= empty;
+    cross_gaps &= empty;
+    (
+        circle_gaps as u64,
+        (circle_gaps >> 64) as u64,
+        cross_gaps as u64,
+        (cross_gaps >> 64) as u64,
+    )
+}
+
 /// 大格开放位图：位 s = grids[s]==0
 #[inline(always)]
 fn open_pattern(grids: &[u8; 9]) -> u16 {
     let mut p = 0u16;
-    for s in 0..9 {
-        p |= ((grids[s] == 0) as u16) << s;
+    for (s, &grid) in grids.iter().enumerate() {
+        p |= ((grid == 0) as u16) << s;
     }
     p
 }
@@ -135,7 +196,18 @@ fn xs64(state: u64) -> u64 {
 fn bmi2() -> bool {
     use std::sync::OnceLock;
     static BMI2: OnceLock<bool> = OnceLock::new();
-    *BMI2.get_or_init(|| std::arch::is_x86_feature_detected!("bmi2"))
+    *BMI2.get_or_init(|| !cfg!(feature = "portable") && std::arch::is_x86_feature_detected!("bmi2"))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn accelerated_cpu() -> bool {
+    use std::sync::OnceLock;
+    static FAST: OnceLock<bool> = OnceLock::new();
+    *FAST.get_or_init(|| {
+        bmi2()
+            && std::arch::is_x86_feature_detected!("popcnt")
+            && std::arch::is_x86_feature_detected!("lzcnt")
+    })
 }
 
 /// 掩码内第 k 个置位的位号（调用方保证 k < popcount）。
@@ -223,18 +295,30 @@ impl Pos {
     /// cells: 81 扁平（sub*9+cell），值 0/1/2
     pub fn from_flat(cells: &[u8], grids: &[u8], forced: i8, turn: u8) -> Pos {
         let mut p = Pos {
-            c0: 0, c1: 0, x0: 0, x1: 0,
+            c0: 0,
+            c1: 0,
+            x0: 0,
+            x1: 0,
             grids: [0; 9],
-            forced, turn,
+            forced,
+            turn,
         };
         p.grids.copy_from_slice(&grids[..9]);
-        for i in 0..81 {
-            match cells[i] {
+        for (i, &cell) in cells.iter().take(81).enumerate() {
+            match cell {
                 1 => {
-                    if i < 64 { p.c0 |= 1u64 << i; } else { p.c1 |= 1u64 << (i - 64); }
+                    if i < 64 {
+                        p.c0 |= 1u64 << i;
+                    } else {
+                        p.c1 |= 1u64 << (i - 64);
+                    }
                 }
                 2 => {
-                    if i < 64 { p.x0 |= 1u64 << i; } else { p.x1 |= 1u64 << (i - 64); }
+                    if i < 64 {
+                        p.x0 |= 1u64 << i;
+                    } else {
+                        p.x1 |= 1u64 << (i - 64);
+                    }
                 }
                 _ => {}
             }
@@ -250,7 +334,10 @@ pub struct Pool {
     pub free: usize,
     pub root: i32,
     // 局面（位板）
-    c0: Vec<u64>, c1: Vec<u64>, x0: Vec<u64>, x1: Vec<u64>,
+    c0: Vec<u64>,
+    c1: Vec<u64>,
+    x0: Vec<u64>,
+    x1: Vec<u64>,
     grids: Vec<[u8; 9]>,
     forced: Vec<i8>,
     turn: Vec<u8>,
@@ -269,8 +356,8 @@ pub struct Pool {
     bm0: Vec<u64>,
     bm1: Vec<u64>,
     // 搜索产物
-    pub stats: [i64; 3],   // [圈赢, 平, 叉赢]
-    pub done: u64,         // 本次 search 实际迭代数
+    pub stats: [i64; 3], // [圈赢, 平, 叉赢]
+    pub done: u64,       // 本次 search 实际迭代数
     rng: u64,
 }
 
@@ -281,8 +368,13 @@ impl Pool {
 
     pub fn with_seed(cap: usize, seed: u64) -> Pool {
         Pool {
-            cap, free: 0, root: -1,
-            c0: vec![0; cap], c1: vec![0; cap], x0: vec![0; cap], x1: vec![0; cap],
+            cap,
+            free: 0,
+            root: -1,
+            c0: vec![0; cap],
+            c1: vec![0; cap],
+            x0: vec![0; cap],
+            x1: vec![0; cap],
             grids: vec![[0; 9]; cap],
             forced: vec![-1; cap],
             turn: vec![0; cap],
@@ -341,8 +433,14 @@ impl Pool {
         self.n_children[i] = 0;
         self.bm0[i] = 0;
         self.bm1[i] = 0;
-        let (l0, l1) = legal_masks(pos.c0, pos.c1, pos.x0, pos.x1,
-                                  open_pattern(&pos.grids), pos.forced);
+        let (l0, l1) = legal_masks(
+            pos.c0,
+            pos.c1,
+            pos.x0,
+            pos.x1,
+            open_pattern(&pos.grids),
+            pos.forced,
+        );
         self.legal_count[i] = pop2(l0, l1) as i32;
         self.root = i as i32;
     }
@@ -360,7 +458,7 @@ impl Pool {
             unsafe { *self.c1.get_unchecked(node) },
             unsafe { *self.x0.get_unchecked(node) },
             unsafe { *self.x1.get_unchecked(node) },
-            open_pattern(unsafe { &*self.grids.get_unchecked(node) }),
+            open_pattern(unsafe { self.grids.get_unchecked(node) }),
             unsafe { *self.forced.get_unchecked(node) },
         );
         let a0 = l0 & !unsafe { *self.bm0.get_unchecked(node) };
@@ -393,19 +491,16 @@ impl Pool {
             } else {
                 self.c1[free] |= 1u64 << (pick - 64);
             }
+        } else if pick < 64 {
+            self.x0[free] |= 1u64 << pick;
         } else {
-            if pick < 64 {
-                self.x0[free] |= 1u64 << pick;
-            } else {
-                self.x1[free] |= 1u64 << (pick - 64);
-            }
+            self.x1[free] |= 1u64 << (pick - 64);
         }
 
         // 小格增量判定（只查包含该格的线，<=4 条）
         let mut w = 0u8;
         let nlines = CELL_LINE_COUNT[cell];
-        for li in 0..nlines {
-            let (m0, m1) = LINE_MASK[sub][cell][li];
+        for &(m0, m1) in LINE_MASK[sub][cell].iter().take(nlines) {
             let ok = if t == 1 {
                 (self.c0[free] & m0) == m0 && (self.c1[free] & m1) == m1
             } else {
@@ -428,7 +523,11 @@ impl Pool {
             }
         }
 
-        self.forced[free] = if self.grids[free][cell] == 0 { cell as i8 } else { -1 };
+        self.forced[free] = if self.grids[free][cell] == 0 {
+            cell as i8
+        } else {
+            -1
+        };
         self.turn[free] = 3 - t;
         self.parent[free] = node as i32;
         self.mv_sub[free] = sub as u8;
@@ -445,8 +544,12 @@ impl Pool {
         let g = self.grids[free];
         let f = self.forced[free];
         let (cl0, cl1) = legal_masks(
-            self.c0[free], self.c1[free], self.x0[free], self.x1[free],
-            open_pattern(&g), f,
+            self.c0[free],
+            self.c1[free],
+            self.x0[free],
+            self.x1[free],
+            open_pattern(&g),
+            f,
         );
         self.legal_count[free] = pop2(cl0, cl1) as i32;
         free
@@ -458,14 +561,14 @@ impl Pool {
     fn tree_policy(&mut self, root: usize) -> usize {
         let mut node = root;
         loop {
-            if big_winner(unsafe { &*self.grids.get_unchecked(node) }) != 0 {
+            if big_winner(unsafe { self.grids.get_unchecked(node) }) != 0 {
                 return node;
             }
             let lc = unsafe { *self.legal_count.get_unchecked(node) } as usize;
             let nc = unsafe { *self.n_children.get_unchecked(node) } as usize;
             if nc < lc {
                 if self.free < self.cap {
-                    let slot = self.free;   // 槽位必须在自增前取出（边界语义同 Python free_arr[0]-1）
+                    let slot = self.free; // 槽位必须在自增前取出（边界语义同 Python free_arr[0]-1）
                     self.free += 1;
                     return self.expand(node, slot);
                 }
@@ -481,8 +584,8 @@ impl Pool {
                 let v = unsafe { *self.visits.get_unchecked(c) };
                 if v > 0 {
                     let vf = v as f64;
-                    let score = unsafe { *self.quality.get_unchecked(c) } / vf
-                        + C_UCB * (ln_n / vf).sqrt();
+                    let score =
+                        unsafe { *self.quality.get_unchecked(c) } / vf + C_UCB * (ln_n / vf).sqrt();
                     if score > best_score {
                         best = ch;
                         best_score = score;
@@ -514,37 +617,50 @@ impl Pool {
     }
 
     /// njit 版 _mcts_batch 等价：batch 次迭代 + 终局分布统计。
+    #[inline(always)]
     fn mcts_batch(&mut self, root: usize, goal: i32, batch: usize) {
         for _ in 0..batch {
             let node = self.tree_policy(root);
-            let w = big_winner(unsafe { &*self.grids.get_unchecked(node) });
-            let reward: f64;
-            if w != 0 {
+            let w = big_winner(unsafe { self.grids.get_unchecked(node) });
+            let reward = if w != 0 {
                 match w {
                     1 => self.stats[0] += 1,
                     2 => self.stats[2] += 1,
                     _ => self.stats[1] += 1,
                 }
-                reward = if w == 3 { 0.0 } else { goal as f64 };
+                if w == 3 {
+                    0.0
+                } else {
+                    goal as f64
+                }
             } else {
                 // P5 约定：rollout 返回 +goal 当行动方（mover）落败
                 let mover = unsafe { *self.turn.get_unchecked(node) };
                 let r = self.rollout(node, goal);
                 if r == -goal {
-                    if mover == 1 { self.stats[0] += 1 } else { self.stats[2] += 1 }
+                    if mover == 1 {
+                        self.stats[0] += 1
+                    } else {
+                        self.stats[2] += 1
+                    }
                 } else if r == goal {
-                    if mover == 1 { self.stats[2] += 1 } else { self.stats[0] += 1 }
+                    if mover == 1 {
+                        self.stats[2] += 1
+                    } else {
+                        self.stats[0] += 1
+                    }
                 } else {
                     self.stats[1] += 1;
                 }
-                reward = r as f64;
-            }
+                r as f64
+            };
             self.backup(node, root, reward);
         }
     }
 
     /// greedy-1 位板 rollout（Python _rollout_bb_g 的逐行移植）。
     /// 增量维护"差一格成线"缺口集：立即赢 → 防立即输 → 随机。
+    #[inline(always)]
     fn rollout(&mut self, node: usize, goal: i32) -> i32 {
         let mut c0 = unsafe { *self.c0.get_unchecked(node) };
         let mut c1 = unsafe { *self.c1.get_unchecked(node) };
@@ -557,53 +673,22 @@ impl Pool {
         let mut decided = grids.iter().filter(|&&g| g != 0).count() as u32;
         let mut open = open_pattern(&grids);
 
-        // 初始化缺口集：扫描已占格的线（重复 OR 无害，查询时 & legal 过滤）
-        let mut my_gap0 = 0u64; let mut my_gap1 = 0u64;
-        let mut op_gap0 = 0u64; let mut op_gap1 = 0u64;
-        let mut empty0 = !(c0 | x0);
-        let mut empty1 = !(c1 | x1);
-        // 已占格位迭代：只访问有棋子的格（中局约 30-40 格 vs 81 格全扫）。
-        // 圈叉互斥，四个字各扫一遍无重复。
-        macro_rules! scan_word {
-            ($word:expr, $base:expr) => {{
-                let mut w = $word;
-                while w != 0 {
-                    let low = w & w.wrapping_neg();
-                    w ^= low;
-                    let i = $base + low.trailing_zeros() as usize;
-                    let s0 = i / 9;
-                    if grids[s0] != 0 {
-                        continue;
-                    }
-                    let c0i = i % 9;
-                    for li in 0..CELL_LINE_COUNT[c0i] {
-                        let (m0, m1) = LINE_MASK[s0][c0i][li];
-                        let n_c = pop2(c0 & m0, c1 & m1);
-                        let n_x = pop2(x0 & m0, x1 & m1);
-                        if n_c == 2 && n_x == 0 {
-                            my_gap0 |= empty0 & m0;
-                            my_gap1 |= empty1 & m1;
-                        } else if n_x == 2 && n_c == 0 {
-                            op_gap0 |= empty0 & m0;
-                            op_gap1 |= empty1 & m1;
-                        }
-                    }
-                }
-            }};
-        }
-        scan_word!(c0, 0);
-        scan_word!(c1, 64);
-        scan_word!(x0, 0);
-        scan_word!(x1, 64);
+        // Two 1 KiB table lookups per open subgrid; skip unused late-game gaps.
+        let (my_gap0, my_gap1, op_gap0, op_gap1) = if decided < 7 {
+            initial_gaps(c0, c1, x0, x1, open)
+        } else {
+            (0, 0, 0, 0)
+        };
+        let mut empty0;
+        let mut empty1;
 
         // mover 视角：mover_gap = 当前行动方的缺口集（回合翻转时交换，
         // 主循环内不再有 turn 分支——语义与圈/叉视角完全一致）
-        let (mut mover_gap0, mut mover_gap1, mut opp_gap0, mut opp_gap1) =
-            if turn == 1 {
-                (my_gap0, my_gap1, op_gap0, op_gap1)
-            } else {
-                (op_gap0, op_gap1, my_gap0, my_gap1)
-            };
+        let (mut mover_gap0, mut mover_gap1, mut opp_gap0, mut opp_gap1) = if turn == 1 {
+            (my_gap0, my_gap1, op_gap0, op_gap1)
+        } else {
+            (op_gap0, op_gap1, my_gap0, my_gap1)
+        };
 
         let mut rng = self.rng;
         let r;
@@ -620,8 +705,12 @@ impl Pool {
             // 残局回退：只剩 <=2 个未决大格时启发价值低，直接纯随机
             let late = decided >= 7;
             let (w0, w1, d0, d1) = if !late {
-                (mover_gap0 & legal0, mover_gap1 & legal1,
-                 opp_gap0 & legal0, opp_gap1 & legal1)
+                (
+                    mover_gap0 & legal0,
+                    mover_gap1 & legal1,
+                    opp_gap0 & legal0,
+                    opp_gap1 & legal1,
+                )
             } else {
                 (0, 0, 0, 0)
             };
@@ -638,9 +727,15 @@ impl Pool {
             let cell = pick % 9;
             // 落子 + 每步一次的 me/op 掩码视角选择
             if turn == 1 {
-                if pick < 64 { c0 |= 1u64 << pick; } else { c1 |= 1u64 << (pick - 64); }
+                if pick < 64 {
+                    c0 |= 1u64 << pick;
+                } else {
+                    c1 |= 1u64 << (pick - 64);
+                }
+            } else if pick < 64 {
+                x0 |= 1u64 << pick;
             } else {
-                if pick < 64 { x0 |= 1u64 << pick; } else { x1 |= 1u64 << (pick - 64); }
+                x1 |= 1u64 << (pick - 64);
             }
             // me* = 行动方石子，op* = 对方（本步内所有线检查共用，无 turn 分支）
             let (me0, me1, op0, op1) = if turn == 1 {
@@ -651,8 +746,7 @@ impl Pool {
             // 更新缺口集 + 小格判定（同一 <=4 线循环；empty 为落子前的值，与 Python 一致）
             let mut w = 0u8;
             let nlines = CELL_LINE_COUNT[cell];
-            for li in 0..nlines {
-                let (m0, m1) = LINE_MASK[sub][cell][li];
+            for &(m0, m1) in LINE_MASK[sub][cell].iter().take(nlines) {
                 let n_me = pop2(me0 & m0, me1 & m1);
                 let n_op = pop2(op0 & m0, op1 & m1);
                 if !late && n_me == 2 && n_op == 0 {
@@ -677,8 +771,7 @@ impl Pool {
             // 大棋盘判定（只查包含该大格的线）
             if grids[sub] == turn {
                 let mut won = false;
-                for li in 0..GRID_LINE_COUNT[sub] {
-                    let l = GRID_LINES[sub][li];
+                for l in GRID_LINES[sub].iter().take(GRID_LINE_COUNT[sub]) {
                     let a = l[0] as usize;
                     let b = l[1] as usize;
                     let d = l[2] as usize;
@@ -730,7 +823,6 @@ impl Pool {
             Some((self.mv_sub[best as usize], self.mv_cell[best as usize]))
         }
     }
-
 
     /// 必胜手优先：落子后直接获胜的子节点（仅求胜模式调用）。
     fn winning_child(&self, turn: u8) -> Option<(u8, u8)> {
@@ -798,6 +890,17 @@ impl Pool {
     /// 单树搜索（树复用 + 容量管理 + 批次时间检查）。
     /// 返回最佳落子；stats/done 为本次搜索产物。
     pub fn search(&mut self, pos: &Pos, goal: i32, iters: u64, budget: f64) -> Option<(u8, u8)> {
+        self.search_with_cancel(pos, goal, iters, budget, None)
+    }
+
+    pub fn search_with_cancel(
+        &mut self,
+        pos: &Pos,
+        goal: i32,
+        iters: u64,
+        budget: f64,
+        cancel: Option<Cancellation<'_>>,
+    ) -> Option<(u8, u8)> {
         if !self.matches_root(pos) {
             self.recycle();
             self.new_root(pos);
@@ -808,34 +911,72 @@ impl Pool {
         }
         self.stats = [0; 3];
         self.done = 0;
-        let deadline = Instant::now()
-            + Duration::from_secs_f64(if budget > 0.0 { budget } else { 1e9 });
-        self.run_batches(pos, goal, iters, deadline);
-        self.finish(goal, pos.turn, self.done)
+        let deadline =
+            Instant::now() + Duration::from_secs_f64(if budget > 0.0 { budget } else { 1e9 });
+        self.run_batches(pos, goal, iters, deadline, cancel);
+        if cancelled(cancel) {
+            None
+        } else {
+            self.finish(goal, pos.turn, self.done)
+        }
     }
 
     /// 批次循环：前提 root 有效、stats/done 已清零。
     /// 容量压力时就地重建根（stats/done 跨重建累计，与 Python 一致）。
-    fn run_batches(&mut self, pos: &Pos, goal: i32, max_it: u64, deadline: Instant) {
-        while self.done < max_it && Instant::now() < deadline {
+    fn run_batches(
+        &mut self,
+        pos: &Pos,
+        goal: i32,
+        max_it: u64,
+        deadline: Instant,
+        cancel: Option<Cancellation<'_>>,
+    ) {
+        while self.done < max_it && !cancelled(cancel) && Instant::now() < deadline {
             if self.cap - self.free < BATCH {
                 self.recycle();
                 self.new_root(pos);
             }
             let b = BATCH.min((max_it - self.done) as usize);
             let root = self.root as usize;
-            self.mcts_batch(root, goal, b);
+            self.run_batch(root, goal, b);
             self.done += b as u64;
         }
     }
 
+    // Dispatch once per batch, not once per simulated move. Only this kernel
+    // enables the extra CPU instructions; the rest of the binary stays portable.
+    fn run_batch(&mut self, root: usize, goal: i32, batch: usize) {
+        #[cfg(target_arch = "x86_64")]
+        if accelerated_cpu() {
+            // SAFETY: all three target features were detected on this CPU.
+            unsafe {
+                self.accelerated_batch(root, goal, batch);
+            }
+            return;
+        }
+        self.mcts_batch(root, goal, batch);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "popcnt,bmi2,lzcnt")]
+    unsafe fn accelerated_batch(&mut self, root: usize, goal: i32, batch: usize) {
+        self.mcts_batch(root, goal, batch);
+    }
+
     /// 并行 worker（从树）：重置后独立随机流跑 per 次迭代。
-    fn run_slave(&mut self, pos: &Pos, goal: i32, per: u64, deadline: Instant) {
+    fn run_slave(
+        &mut self,
+        pos: &Pos,
+        goal: i32,
+        per: u64,
+        deadline: Instant,
+        cancel: Option<Cancellation<'_>>,
+    ) {
         self.recycle();
         self.new_root(pos);
         self.stats = [0; 3];
         self.done = 0;
-        self.run_batches(pos, goal, per, deadline);
+        self.run_batches(pos, goal, per, deadline, cancel);
     }
 }
 
@@ -887,6 +1028,22 @@ pub fn search_parallel(
     budget: f64,
     threads: usize,
 ) -> Option<(u8, u8)> {
+    search_parallel_with_cancel(main, pos, goal, iters, budget, threads, None)
+}
+
+fn search_parallel_with_cancel(
+    main: &mut Pool,
+    pos: &Pos,
+    goal: i32,
+    iters: u64,
+    budget: f64,
+    threads: usize,
+    cancel: Option<Cancellation<'_>>,
+) -> Option<(u8, u8)> {
+    let threads = threads.clamp(1, 32).min(iters.max(1) as usize);
+    if threads == 1 {
+        return main.search_with_cancel(pos, goal, iters, budget, cancel);
+    }
     if !main.matches_root(pos) {
         main.recycle();
         main.new_root(pos);
@@ -900,20 +1057,18 @@ pub fn search_parallel(
 
     let per = (iters / threads as u64).max(1);
     let main_it = iters - per * (threads - 1) as u64;
-    let deadline = Instant::now()
-        + Duration::from_secs_f64(if budget > 0.0 { budget } else { 1e9 });
+    let deadline =
+        Instant::now() + Duration::from_secs_f64(if budget > 0.0 { budget } else { 1e9 });
 
     let mut slaves = take_slaves(threads - 1, per);
     std::thread::scope(|s| {
         for (i, p) in slaves.iter_mut().enumerate() {
-            let seed = 0x9E37_79B9u64
-                .wrapping_add((i as u64).wrapping_mul(0x85EB_CA6B))
-                | 1;
+            let seed = 0x9E37_79B9u64.wrapping_add((i as u64).wrapping_mul(0x85EB_CA6B)) | 1;
             p.rng = seed;
-            s.spawn(move || p.run_slave(pos, goal, per, deadline));
+            s.spawn(move || p.run_slave(pos, goal, per, deadline, cancel));
         }
         // 主线程跑主树（树复用：root 已在上方校验/重建）
-        main.run_batches(pos, goal, main_it, deadline);
+        main.run_batches(pos, goal, main_it, deadline, cancel);
     });
 
     let mut total = main.done;
@@ -924,6 +1079,11 @@ pub fn search_parallel(
         total += p.done;
     }
     main.done = total;
+
+    if cancelled(cancel) {
+        return_slaves(slaves);
+        return None;
+    }
 
     // 必胜手优先（仅求胜模式）
     if goal > 0 {
@@ -973,10 +1133,22 @@ pub fn search_dispatch(
     budget: f64,
     threads: usize,
 ) -> Option<(u8, u8)> {
+    search_dispatch_with_cancel(main, pos, goal, iters, budget, threads, None)
+}
+
+pub fn search_dispatch_with_cancel(
+    main: &mut Pool,
+    pos: &Pos,
+    goal: i32,
+    iters: u64,
+    budget: f64,
+    threads: usize,
+    cancel: Option<Cancellation<'_>>,
+) -> Option<(u8, u8)> {
     if threads > 1 && iters > 5000 {
-        search_parallel(main, pos, goal, iters, budget, threads)
+        search_parallel_with_cancel(main, pos, goal, iters, budget, threads, cancel)
     } else {
-        main.search(pos, goal, iters, budget)
+        main.search_with_cancel(pos, goal, iters, budget, cancel)
     }
 }
 
@@ -998,6 +1170,91 @@ mod tests {
 
     fn opening_pos() -> Pos {
         Pos::from_flat(&[0u8; 81], &[0u8; 9], -1, 1)
+    }
+
+    #[test]
+    fn gap_lookup_matches_line_scan_exhaustively() {
+        for own in 0u16..512 {
+            for opponent in 0u16..512 {
+                if own & opponent != 0 {
+                    continue;
+                }
+                let mut expected = 0;
+                for [a, b, c] in crate::engine::WIN_LINES {
+                    let mask = (1 << a) | (1 << b) | (1 << c);
+                    if (own & mask).count_ones() == 2 && opponent & mask == 0 {
+                        expected |= mask & !own;
+                    }
+                }
+                assert_eq!(GAP_TABLE[own as usize] & !(own | opponent), expected);
+                // Cover every flat-board offset, including the 64-bit boundary.
+                for sub in 0..9 {
+                    let circles = (own as u128) << (sub * 9);
+                    let crosses = (opponent as u128) << (sub * 9);
+                    let (lo, hi, _, _) = initial_gaps(
+                        circles as u64,
+                        (circles >> 64) as u64,
+                        crosses as u64,
+                        (crosses >> 64) as u64,
+                        1 << sub,
+                    );
+                    assert_eq!(
+                        lo as u128 | ((hi as u128) << 64),
+                        (expected as u128) << (sub * 9)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_seed_search_preserves_reference_results() {
+        // Captured from the supplied patch before lookup/kernel changes.
+        let expected = [
+            ((2, 0), [3397, 1655, 2948]),
+            ((2, 1), [3400, 1686, 2914]),
+            ((4, 8), [3401, 1695, 2904]),
+            ((1, 3), [3421, 1683, 2896]),
+            ((7, 6), [3375, 1708, 2917]),
+            ((0, 1), [3333, 1693, 2974]),
+            ((7, 6), [3173, 1054, 3773]),
+            ((7, 4), [3300, 1067, 3633]),
+            ((7, 7), [3441, 808, 3751]),
+            ((7, 8), [2788, 1268, 3944]),
+            ((7, 8), [2777, 1276, 3947]),
+            ((7, 2), [2967, 1171, 3862]),
+            ((8, 2), [8000, 0, 0]),
+            ((8, 2), [8000, 0, 0]),
+            ((8, 2), [8000, 0, 0]),
+            ((6, 8), [156, 7842, 2]),
+            ((6, 8), [148, 7850, 2]),
+            ((6, 8), [150, 7847, 3]),
+        ];
+        let mut index = 0;
+        for (_, game) in crate::session::benchmark_positions() {
+            let flat: Vec<u8> = game.cells.iter().flatten().copied().collect();
+            let pos = Pos::from_flat(&flat, &game.grids, game.forced, game.turn);
+            for goal in [1, -1] {
+                for seed in [1, 42, 20260908] {
+                    let mut pool = Pool::with_seed(65536, seed);
+                    assert_eq!(pool.search(&pos, goal, 8000, 0.0), Some(expected[index].0));
+                    assert_eq!(pool.stats, expected[index].1);
+                    assert_eq!(pool.done, 8000);
+                    index += 1;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bit_selection_matches_software_fallback() {
+        let mut word = 1u64;
+        for _ in 0..2000 {
+            word = xs64(word);
+            for k in 0..word.count_ones() as u64 {
+                assert_eq!(kth64(word, k), kth64_loop(word, k));
+            }
+        }
     }
 
     #[test]
@@ -1029,7 +1286,9 @@ mod tests {
     fn terminal_returns_none() {
         let mut p = Pool::new(4_096);
         let mut grids = [0u8; 9];
-        grids[0] = 1; grids[4] = 1; grids[8] = 1;
+        grids[0] = 1;
+        grids[4] = 1;
+        grids[8] = 1;
         let pos = Pos::from_flat(&[0u8; 81], &grids, -1, 2);
         let mv = p.search(&pos, 1, 100, 0.0);
         assert_eq!(mv, None);
@@ -1056,6 +1315,13 @@ mod tests {
         assert!(mv2.is_some());
         // 复用真实生效：传入的根节点统计被继续使用（visits 增长）
         assert!(p.visits[p.root as usize] > visits_before);
+    }
+
+    #[test]
+    fn parallel_budget_smaller_than_thread_count_is_bounded() {
+        let mut pool = Pool::with_seed(4096, 42);
+        assert!(search_parallel(&mut pool, &opening_pos(), 1, 1, 0.0, 8).is_some());
+        assert_eq!(pool.done, 1);
     }
 
     #[test]
@@ -1091,6 +1357,29 @@ mod tests {
         for _ in 0..200 {
             let r = p.rollout(0, 1);
             assert!(r == -1 || r == 0 || r == 1, "reward out of domain: {r}");
+        }
+    }
+
+    #[test]
+    fn cancelled_search_returns_no_move_without_spending_iterations() {
+        let generation = AtomicU64::new(2);
+        let cancel = Cancellation {
+            generation: &generation,
+            expected: 1,
+        };
+        for threads in [1, 4] {
+            let mut pool = Pool::new(65_536);
+            let result = search_dispatch_with_cancel(
+                &mut pool,
+                &opening_pos(),
+                1,
+                8_000,
+                0.0,
+                threads,
+                Some(cancel),
+            );
+            assert_eq!(result, None);
+            assert_eq!(pool.done, 0);
         }
     }
 }

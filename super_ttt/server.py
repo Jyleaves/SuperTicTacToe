@@ -1,15 +1,7 @@
-"""pywebview JS ↔ Rust 后端桥。
+"""pywebview front-end bridge to the Rust rules engine and single-tree AI.
 
-2026-08-16 后端迁移：规则引擎 + MCTS 全部重写为 Rust（rust/ 目录，
-cdylib sttt.dll，零依赖、无 GC、原生多线程）。本文件只剩薄桥：
-参数转 JSON → ctypes 调用 → json.loads 返回。
-
-前端 JS 契约与旧 Python 后端完全一致（new_game / play / ai_move /
-resign / stats / precompile_status / legal_moves / ping）。
-游戏状态全部由 Rust 会话持有；AI 搜索在 Rust 内部并行（root
-parallelization ×N），ctypes 调用期间释放 GIL，UI 永不阻塞。
-
-Rust 已是预编译机器码：无 JIT 预热，precompile_status 恒就绪。
+ctypes releases the GIL during calls. Versioned requests and cancellable searches
+keep state access responsive; display-only evaluation runs in the background.
 """
 
 from __future__ import annotations
@@ -54,6 +46,16 @@ def _bind(lib: ctypes.CDLL) -> None:
     lib.sttt_ai_move.restype = c_char_p
     lib.sttt_resign.restype = c_char_p
     lib.sttt_stats.restype = c_char_p
+    for name, argtypes in (
+        ("sttt_play_version", [ctypes.c_int, ctypes.c_int, ctypes.c_int64]),
+        ("sttt_ai_move_version", [ctypes.c_int64]),
+        ("sttt_resign_game", [ctypes.c_int64]),
+        ("sttt_cancel_game", [ctypes.c_int64]),
+        ("sttt_set_stats_enabled", [ctypes.c_int, ctypes.c_int64]),
+    ):
+        fn = getattr(lib, name)
+        fn.argtypes = argtypes
+        fn.restype = c_char_p
     lib.sttt_legal_moves.restype = c_char_p
     # 对弈验证 / 基准测试用原始接口
     i8p = ctypes.POINTER(ctypes.c_int8)
@@ -145,14 +147,22 @@ class Api:
         # 落子后的开局评估是异步的：立即返回首帧状态
         return st
 
-    def play(self, sub, cell):
-        return _call_state(_LIB.sttt_play, int(sub), int(cell))
+    def play(self, sub, cell, version=None):
+        return _call_state(_LIB.sttt_play_version, int(sub), int(cell),
+                           -1 if version is None else int(version))
 
-    def ai_move(self):
-        return _call_state(_LIB.sttt_ai_move)
+    def ai_move(self, version=None):
+        return _call_state(_LIB.sttt_ai_move_version, -1 if version is None else int(version))
 
-    def resign(self):
-        return _call_state(_LIB.sttt_resign)
+    def resign(self, game_id=None):
+        return _call_state(_LIB.sttt_resign_game, -1 if game_id is None else int(game_id))
+
+    def cancel_game(self, game_id=None):
+        return _call(_LIB.sttt_cancel_game, -1 if game_id is None else int(game_id))
+
+    def set_stats_enabled(self, enabled, game_id=None):
+        return _call(_LIB.sttt_set_stats_enabled, int(bool(enabled)),
+                     -1 if game_id is None else int(game_id))
 
     def stats(self):
         return _call(_LIB.sttt_stats)

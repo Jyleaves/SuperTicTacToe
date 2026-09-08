@@ -16,10 +16,11 @@ def main():
     lib = ctypes.CDLL(os.path.abspath(dll))
     lib.sttt_bench.restype = ctypes.c_char_p
     rows = json.loads(lib.sttt_bench().decode("utf-8"))
-    print(f"{'workload':<9} {'thr':>3}   {'iters/s':>10}")
+    print(f"{'workload':<9} {'thr':>3}   {'search/s':>10} {'with pool/s':>12}")
     logs = []
     for r in rows:
-        print(f"{r['workload']:<9} {r['threads']:>3}   {r['iters_per_s']:>10.0f}")
+        print(f"{r['workload']:<9} {r['threads']:>3}   {r['iters_per_s']:>10.0f}"
+              f" {r.get('with_pool_iters_per_s', 0):>12.0f}")
         logs.append(math.log(r["iters_per_s"]))
     print(f"\ngeomean: {math.exp(sum(logs)/len(logs)):.0f}/s")
 

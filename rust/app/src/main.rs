@@ -8,7 +8,7 @@
 //! app.js 的桥代理无感切换。界面/样式/动画完全一致。
 //!
 //! 发布形态：GUI 子系统（双击无控制台黑框）+ 静态链接 CRT
-//! （见 rust/.cargo/config.toml 的 +crt-static，单文件免 VC++ 运行库）。
+//! （见 .cargo/config.toml 的 +crt-static，单文件免 VC++ 运行库）。
 
 // GUI 子系统：双击不弹控制台（debug 构建保留控制台便于开发）
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -33,7 +33,11 @@ const STYLE_CSS: &str = include_str!("../../../web/style.css");
 
 enum UserEvent {
     /// 快方法（ping/play/stats 等，微秒级）：直接在 UI 线程分发
-    Rpc { id: u64, method: String, args: Vec<Value> },
+    Rpc {
+        id: u64,
+        method: String,
+        args: Vec<Value>,
+    },
     /// worker 线程完成长操作（ai_move 搜索）：回传结果
     Respond { id: u64, ok: bool, json: String },
     /// 页面 DOM 就绪（或兜底超时）：显示窗口，消除初始化白屏
@@ -61,7 +65,7 @@ const ADAPTER_JS: &str = r#"
     else { p.rej(new Error(json)); }
   };
   var METHODS = ['ping', 'precompile_status', 'new_game', 'play', 'ai_move',
-                 'resign', 'stats', 'legal_moves', 'exit_app'];
+                 'resign', 'stats', 'set_stats_enabled', 'cancel_game', 'legal_moves', 'exit_app'];
   var api = {};
   METHODS.forEach(function (m) {
     api[m] = function () {
@@ -145,7 +149,9 @@ fn js_escape(s: &str) -> String {
 fn respond(wv: &SharedWebView, id: u64, ok: bool, json: String) {
     let js = format!(
         "window.__stttIpcResult({},{},\"{}\")",
-        id, ok, js_escape(&json)
+        id,
+        ok,
+        js_escape(&json)
     );
     if let Some(webview) = wv.borrow().as_ref() {
         let _ = webview.evaluate_script(&js);
@@ -158,25 +164,40 @@ fn dispatch(method: &str, args: &[Value]) -> Result<String, String> {
         "ping" => Ok(sttt::session::ping_json()),
         "precompile_status" => Ok(sttt::session::precompile_json()),
         "stats" => Ok(sttt::session::stats_json()),
+        "set_stats_enabled" => {
+            let enabled = args.first().and_then(Value::as_bool).unwrap_or(true);
+            sttt::session::set_stats_enabled(enabled, args.get(1).and_then(Value::as_u64));
+            Ok(sttt::session::stats_json())
+        }
+        "cancel_game" => {
+            sttt::session::cancel_game(args.first().and_then(Value::as_u64));
+            Ok("{\"ok\":true}".to_string())
+        }
         "legal_moves" => Ok(sttt::session::legal_moves_json()),
         "new_game" => {
             let s = args.first().ok_or("new_game: missing settings")?;
             let g = |k: &str| s.get(k).and_then(Value::as_i64).unwrap_or(0) as i32;
-            sttt::session::new_game(g("mode"), g("difficulty"), g("first"), g("goal"));
-            Ok(sttt::session::state_json())
+            let state = sttt::session::new_game_with_stats(
+                g("mode"),
+                g("difficulty"),
+                g("first"),
+                g("goal"),
+                s.get("stats").and_then(Value::as_bool).unwrap_or(true),
+            );
+            Ok(state)
         }
         "play" => {
             let sub = args.first().and_then(Value::as_i64).unwrap_or(0) as i32;
             let cell = args.get(1).and_then(Value::as_i64).unwrap_or(0) as i32;
-            sttt::session::play(sub, cell);
+            sttt::session::play_at_version(sub, cell, args.get(2).and_then(Value::as_u64));
             Ok(sttt::session::state_json())
         }
         "ai_move" => {
-            sttt::session::ai_move();
+            sttt::session::ai_move_at_version(args.first().and_then(Value::as_u64));
             Ok(sttt::session::state_json())
         }
         "resign" => {
-            sttt::session::resign();
+            sttt::session::resign_game(args.first().and_then(Value::as_u64));
             Ok(sttt::session::state_json())
         }
         _ => Err(format!("unknown method: {method}")),
@@ -217,6 +238,14 @@ mod native_msg {
 fn main() {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::Duration;
+
+    // Measures the engine linked into the shipping EXE without creating WebView2.
+    if std::env::args().any(|arg| arg == "--bench-engine") {
+        let json = sttt::session::bench_json();
+        let _ = std::io::stdout().write_all(json.as_bytes());
+        std::fs::write("bench_engine_result.json", json).expect("write engine benchmark");
+        return;
+    }
 
     let t0 = std::time::Instant::now();
     // 启动分阶段计时（?startup 模式落盘）
@@ -321,7 +350,11 @@ fn main() {
                         let _ = p.send_event(UserEvent::Respond { id, ok: true, json });
                     }
                     Err(e) => {
-                        let _ = p.send_event(UserEvent::Respond { id, ok: false, json: e });
+                        let _ = p.send_event(UserEvent::Respond {
+                            id,
+                            ok: false,
+                            json: e,
+                        });
                     }
                 });
             } else {
@@ -347,7 +380,7 @@ fn main() {
     let shared: SharedWebView = Rc::new(RefCell::new(Some(webview)));
     T_BUILT.store(t0.elapsed().as_millis() as u64, Ordering::Relaxed);
 
-    let show_deadline = t0 + Duration::from_secs(3);   // 就绪信号丢失时的兜底
+    let show_deadline = t0 + Duration::from_secs(3); // 就绪信号丢失时的兜底
     event_loop.run(move |event, _, control_flow| {
         // 未显示前用 WaitUntil 兜底：3s 内没等到 __page_ready 也强制显示
         if !SHOWN.load(Ordering::Relaxed) {
@@ -358,17 +391,17 @@ fn main() {
         match event {
             Event::UserEvent(UserEvent::Show) => {
                 if !SHOWN.swap(true, Ordering::Relaxed) {
-                    T_SHOWN.store(t0.elapsed().as_millis() as u64,
-                                  Ordering::Relaxed);
-                    let _ = window.set_visible(true);
+                    T_SHOWN.store(t0.elapsed().as_millis() as u64, Ordering::Relaxed);
+                    window.set_visible(true);
                     if startup_mode {
                         let report = format!(
                             "[startup] webview构建 {}ms | DOM就绪 {}ms | 显示 {}ms\n",
                             T_BUILT.load(Ordering::Relaxed),
                             T_READY.load(Ordering::Relaxed),
-                            T_SHOWN.load(Ordering::Relaxed));
-                        let _ = std::io::Write::write_all(
-                            &mut std::io::stdout(), report.as_bytes());
+                            T_SHOWN.load(Ordering::Relaxed)
+                        );
+                        let _ =
+                            std::io::Write::write_all(&mut std::io::stdout(), report.as_bytes());
                         let _ = std::fs::write("startup_result.txt", &report);
                         let _ = proxy.send_event(UserEvent::Exit);
                     }
@@ -386,9 +419,7 @@ fn main() {
                     Err(e) => respond(&shared, id, false, e),
                 }
             }
-            Event::UserEvent(UserEvent::Respond { id, ok, json }) => {
-                respond(&shared, id, ok, json)
-            }
+            Event::UserEvent(UserEvent::Respond { id, ok, json }) => respond(&shared, id, ok, json),
             Event::UserEvent(UserEvent::Exit) => *control_flow = ControlFlow::Exit,
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,

@@ -12,8 +12,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from super_ttt import engine, mcts  # noqa: E402
-from super_ttt.server import rust_legal  # noqa: E402
+from super_ttt import engine  # noqa: E402
+from super_ttt.server import Api, rust_legal  # noqa: E402
 
 
 def flat_cells(g):
@@ -24,6 +24,8 @@ def check_game(seed, use_ai_moves):
     """随机（或 AI 驱动）走一整局，逐步校验两引擎一致。返回 (步数, 终局一致)."""
     rnd = random.Random(seed)
     g = engine.Game()
+    api = Api()
+    state = api.new_game(dict(mode=1, difficulty=-1, first=0, goal=1, stats=False))
     steps = 0
     mismatch = None
     while not g.is_over():
@@ -47,6 +49,12 @@ def check_game(seed, use_ai_moves):
             mismatch = f"python rejected move {mv} @step{steps}"
             break
         steps += 1
+        state = api.play(*mv)
+        expected = dict(cells=g.cells, grids=g.grids, forced=g.forced, turn=g.turn,
+                        winner=g.winner, lastMove=g.last_move, winLine=g.win_line)
+        for key, value in expected.items():
+            if state[key] != value:
+                return f"state mismatch @step{steps}: {key}: python={value} rust={state[key]}"
         if steps > 200:
             break
     if mismatch:
@@ -56,7 +64,7 @@ def check_game(seed, use_ai_moves):
     py_moves = [tuple(m) for m in g.legal_moves()]
     if g.is_over() and py_moves:
         return f"over but python legal={len(py_moves)}"
-    if not g.is_over() and rs != py_moves:
+    if rs != py_moves:
         return f"final legal mismatch py={py_moves[:3]} rust={rs[:3]}"
     return f"ok steps={steps} winner={g.winner}"
 
@@ -67,11 +75,6 @@ def mcts_search_once(g, iters):
 
 
 def main():
-    try:
-        import numpy  # noqa: F401
-    except ImportError:
-        print("需要 numpy（duel 依赖）")
-        return
     games = int(os.environ.get("EQUIV_GAMES", "300"))
     random.seed(20260816)
     bad = 0

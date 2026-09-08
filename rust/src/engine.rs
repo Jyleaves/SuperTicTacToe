@@ -13,9 +13,14 @@ pub const GRID_OPEN: u8 = 0;
 pub const GRID_TIE: u8 = 3;
 
 pub const WIN_LINES: [[usize; 3]; 8] = [
-    [0, 1, 2], [3, 4, 5], [6, 7, 8],
-    [0, 3, 6], [1, 4, 7], [2, 5, 8],
-    [0, 4, 8], [2, 4, 6],
+    [0, 1, 2],
+    [3, 4, 5],
+    [6, 7, 8],
+    [0, 3, 6],
+    [1, 4, 7],
+    [2, 5, 8],
+    [0, 4, 8],
+    [2, 4, 6],
 ];
 
 /// 哨兵：线表不足 4 条时填充（合法相对下标 0..=8）
@@ -121,13 +126,12 @@ impl Game {
         if self.winner != 0 {
             return moves;
         }
-        let forced_sub: Option<usize> = if self.forced >= 0
-            && self.grids[self.forced as usize] == GRID_OPEN
-        {
-            Some(self.forced as usize)
-        } else {
-            None
-        };
+        let forced_sub: Option<usize> =
+            if self.forced >= 0 && self.grids[self.forced as usize] == GRID_OPEN {
+                Some(self.forced as usize)
+            } else {
+                None
+            };
         let subs: Vec<usize> = match forced_sub {
             Some(s) => vec![s],
             None => (0..9).filter(|&s| self.grids[s] == GRID_OPEN).collect(),
@@ -276,7 +280,9 @@ mod tests {
     #[test]
     fn subgrid_full_without_winner_is_tie() {
         let mut g = Game::new();
-        g.cells[5] = [0, CIRCLE, CROSS, CROSS, CROSS, CIRCLE, CIRCLE, CROSS, CIRCLE];
+        g.cells[5] = [
+            0, CIRCLE, CROSS, CROSS, CROSS, CIRCLE, CIRCLE, CROSS, CIRCLE,
+        ];
         assert!(g.apply_move(5, 0));
         assert_eq!(g.grids[5], GRID_TIE);
     }

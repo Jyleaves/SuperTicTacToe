@@ -4,6 +4,7 @@
 """
 
 import os
+import json
 import sys
 import threading
 import time
@@ -38,7 +39,7 @@ FLOW_JS = """
     // 设置：人机/幼稚/人先手/赢得对局/音效关（并直接改 S.settings 模拟已持久化）
     localStorage.setItem('sttt.settings', JSON.stringify(
       {mode:0, difficulty:-1, first:0, goal:1, sound:false}));
-    S.settings.sound = false;
+    Object.assign(S.settings, {mode:0, difficulty:-1, first:0, goal:1, sound:false, stats:true});
 
     // ---- 开局 ----
     document.getElementById('btn-start').click();
@@ -48,7 +49,7 @@ FLOW_JS = """
 
     // ---- 人类落子：棋子必须立即显示（AI 思考尚未结束） ----
     document.querySelector('.cell.playable').click();
-    await W(150);   // AI 思考需 1.5s，此刻必然仍在思考中
+    await waitFor(() => document.querySelectorAll('.cell.circle').length === 1);
     r.immediate = {
       humanPieceShown: document.querySelectorAll('.cell.circle').length === 1,
       aiThinking: !document.getElementById('thinking').classList.contains('hidden'),
@@ -138,6 +139,8 @@ def main():
         js_api=api, width=660, height=740, text_select=False, easy_drag=False,
     )
 
+    results = []
+
     def run():
         time.sleep(1.5)                     # 等页面加载
         try:
@@ -155,13 +158,36 @@ def main():
             if result:
                 break
         print("SMOKE RESULTS:", result)
+        if result:
+            results.append(json.loads(result))
         window.destroy()
 
-    threading.Timer(60, lambda: (window.destroy(), None)).start()  # 兜底
-    webview.start(func=run, gui="edgechromium")
-    time.sleep(1)
+    watchdog = threading.Timer(60, window.destroy)
+    watchdog.daemon = True
+    watchdog.start()
+    try:
+        webview.start(func=run, gui="edgechromium")
+    finally:
+        watchdog.cancel()
+    assert results, "GUI test timed out or did not return a result"
+    result = results[0]
+    assert not result.get("error"), result.get("error")
+    assert not result["jsErrors"], result["jsErrors"]
+    assert result["menu"] and result["started"] == {"cells": 81, "playable": 81}
+    assert result["immediate"]["humanPieceShown"]
+    assert result["afterAi"]["pieces"] == 2 and result["afterAi"]["turn"] == 1
+    assert result["resignConfirmShown"] and result["resign"]["winner"] == 2
+    assert result["endCardMenuWorks"]
+    assert result["settingsModal"]["shown"] and result["settingsModal"]["closed"]
+    assert result["settingsModal"]["rows"] == 2
+    assert result["menuConfirmShown"] and result["menuCancelStays"] and result["menuConfirmWorks"]
+    assert result["escWorks"]
+    rules = result["rules"]
+    assert rules["heightStable"] and rules["backToMenu"] and rules["indicatorCount"] == 1
+    assert rules["page1"] != rules["pageAfterNext"] and rules["page1"] == rules["pageAfterPrev"]
+
 
 
 if __name__ == "__main__":
     main()
-    print("SMOKE: DONE")
+    print("SMOKE: PASS")

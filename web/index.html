@@ -120,7 +120,11 @@
         </div>
       </div>
     </div>
-    <div class="thinking hidden" id="thinking">
+    <div class="game-error hidden" id="game-error" role="alert">
+      <span>操作未完成，请重试。</span>
+      <button class="btn small ghost" id="btn-retry">重试</button>
+    </div>
+    <div class="thinking hidden" id="thinking" role="status">
       <span>AI 思考中</span>
       <span class="dots"><i></i><i></i><i></i></span>
     </div>

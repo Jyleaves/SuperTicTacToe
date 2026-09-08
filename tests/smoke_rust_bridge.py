@@ -46,12 +46,16 @@ def main():
         r = api.stats()
         if r["stats"]:
             final = r["stats"]
-            if sum(final) >= 180_000:
+            if not r["busy"]:
                 break
         time.sleep(0.05)
     total = sum(final or [0, 0, 0])
     print(f"stats ok: {final}（共 {total} 次终局模拟, busy={r['busy']}）")
-    assert total >= 180_000, "评估应细化到 18 万迭代"
+    assert 0 < total <= 180_000 and not r["busy"], "评估应完成或达到软时间上限"
+
+    api.set_stats_enabled(False, st["gameId"])
+    assert not api.stats()["busy"]
+    assert api.stats()["stats"] is None
 
     # ---- 认输
     st = api.resign()

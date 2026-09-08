@@ -1,0 +1,11 @@
+# Shared by the core DLL, desktop application and CI commands run from the repo.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+# Keep a portable CPU baseline. BMI2 is selected by runtime feature detection.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]
