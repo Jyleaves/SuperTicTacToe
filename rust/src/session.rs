@@ -329,7 +329,9 @@ pub fn ai_move_at_version(expected: Option<u64>) {
     if cancel.is_cancelled() {
         return;
     }
-    let mut t = tree.unwrap_or_else(|| Pool::new(pool_capacity(iters)));
+    // Keep the original AI capacity: shrinking it discards reusable search
+    // statistics earlier. The display-only evaluator may use smaller pools.
+    let mut t = tree.unwrap_or_else(|| Pool::new(NODE_CAP));
     let mv = search_dispatch_with_cancel(&mut t, &pos, goal, iters, budget, threads, Some(cancel));
     let mut s = session().lock().unwrap();
     if !s.active || s.version != version {

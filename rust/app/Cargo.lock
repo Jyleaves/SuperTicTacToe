@@ -1830,11 +1830,11 @@ dependencies = [
 
 [[package]]
 name = "sttt"
-version = "1.1.0"
+version = "1.1.1"
 
 [[package]]
 name = "sttt-app"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "serde_json",
  "sttt",

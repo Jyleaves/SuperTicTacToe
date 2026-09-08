@@ -9,6 +9,7 @@ TestApiIntegration 走真实后端（Rust sttt.dll，2026-08-16 迁移后）—�
 
 import random
 import unittest
+from unittest.mock import patch
 
 from super_ttt import ai, engine
 from super_ttt.engine import Game, CIRCLE, CROSS
@@ -42,26 +43,28 @@ class TestSearch(unittest.TestCase):
     def test_tree_reuse_find_child(self):
         random.seed(2)
         g = Game()
-        g.apply_move(0, 0)
+        self.assertTrue(g.apply_move(0, 0))
         cells, grids, forced, turn = self._state(g)
-        move, node = ai.search(cells, grids, forced, turn, budget=0.15)
+        with patch.object(ai, "MAX_ITERATIONS", 512):
+            move, selected = ai.search(cells, grids, forced, turn, budget=30.0)
         self.assertIsNotNone(move)
-        # 人类按 AI 的落子区域落子后，应能在子树中找到对应节点
-        sub, cell = move
-        g.apply_move(sub, cell)
-        # 人类落子（强制格内任意合法位置）
-        human_move = g.legal_moves()[0]
-        g.apply_move(*human_move)
+        self.assertEqual(selected.parent.visits, 512)
+        # Reuse an actually expanded two-ply path. A short wall-clock budget
+        # does not guarantee expansion of an arbitrary opponent reply.
+        node = next(child for child in selected.parent.children if child.children)
+        self.assertTrue(g.apply_move(*node.move))
+        human_move = node.children[0].move
+        self.assertTrue(g.apply_move(*human_move))
         cells, grids, forced, turn = self._state(g)
         reused = ai.find_child(node, human_move)
-        self.assertIsNotNone(reused)
+        self.assertIs(reused, node.children[0])
         visits_before = reused.visits
-        move2, node2 = ai.search(cells, grids, forced, turn, budget=0.1,
+        with patch.object(ai, "MAX_ITERATIONS", 64):
+            move2, _ = ai.search(cells, grids, forced, turn, budget=30.0,
                                  root=reused)
         self.assertIsNotNone(move2)
         self.assertIn(tuple(move2), [tuple(m) for m in g.legal_moves()])
-        # 树复用真实生效：传入的根节点统计被继续使用（visits 增长）
-        self.assertGreater(reused.visits, visits_before)
+        self.assertEqual(reused.visits, visits_before + 64)
 
     def test_stale_root_rebuilds(self):
         """局面不匹配的复用根应被自动重建，不崩溃。"""

@@ -6,12 +6,13 @@
 //! - 合法步计数 / 选择 / 线检查全部位运算（popcnt / ctz 硬件指令）；
 //! - 热路径（tree_policy / expand / backup / rollout）无边界检查。
 //!
-//! 算法语义逐条对齐 Python 版：
+//! 搜索主体沿用 Python 版，最终选步增加精确的一步失利检查：
 //! - UCB1 c=0.8，best_child 取 quality/visits + c·sqrt(lnN/n) 最大；
 //! - 收益约定：rollout 返回 +goal 当叶子行动方落败；backup 逐层取反；
 //! - 展开顺序：从剩余未展开合法步中均匀随机选一个（与 Python randrange 语义一致）；
 //! - greedy-1 rollout：立即赢 → 防立即输 → 随机；decided>=7 残局回退纯随机；
-//! - 必胜手优先（仅 goal>0）；树复用两步提升；root parallelization 投票合并。
+//! - 求胜时优先立即制胜，最终选步排除可避免的一步失利；
+//! - 树复用两步提升；root parallelization 投票合并。
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -838,6 +839,70 @@ impl Pool {
         None
     }
 
+    /// Whether the opponent can win the whole game on their very next legal move.
+    fn allows_immediate_loss(&self, child: usize, turn: u8) -> bool {
+        let opponent = 3 - turn;
+        let grids = &self.grids[child];
+        if big_winner(grids) != 0 {
+            return false;
+        }
+        let mut won = 0usize;
+        let mut open = 0u16;
+        for (sub, &status) in grids.iter().enumerate() {
+            if status == opponent {
+                won |= 1 << sub;
+            }
+            if status == 0 {
+                open |= 1 << sub;
+            }
+        }
+        let mut threats = GAP_TABLE[won] & open;
+        if self.forced[child] >= 0 {
+            threats &= 1 << self.forced[child];
+        }
+        if threats == 0 {
+            return false;
+        }
+        let occupied = ((self.c1[child] | self.x1[child]) as u128) << 64
+            | (self.c0[child] | self.x0[child]) as u128;
+        let stones = if opponent == 1 {
+            (self.c1[child] as u128) << 64 | self.c0[child] as u128
+        } else {
+            (self.x1[child] as u128) << 64 | self.x0[child] as u128
+        };
+        while threats != 0 {
+            let sub = threats.trailing_zeros() as usize;
+            threats &= threats - 1;
+            let local = ((stones >> (sub * 9)) & 511) as usize;
+            let empty = !((occupied >> (sub * 9)) as u16) & 511;
+            if GAP_TABLE[local] & empty != 0 {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn safe_move(&self, turn: u8) -> Option<(u8, u8)> {
+        let root = self.root as usize;
+        let ln_n = (self.visits[root].max(1) as f64).ln();
+        let mut best = None;
+        let mut best_score = f64::NEG_INFINITY;
+        let mut ch = self.first_child[root];
+        while ch >= 0 {
+            let c = ch as usize;
+            if self.visits[c] > 0 && !self.allows_immediate_loss(c, turn) {
+                let vf = self.visits[c] as f64;
+                let score = self.quality[c] / vf + C_UCB * (ln_n / vf).sqrt();
+                if score > best_score {
+                    best_score = score;
+                    best = Some((self.mv_sub[c], self.mv_cell[c]));
+                }
+            }
+            ch = self.next_sib[c];
+        }
+        best
+    }
+
     /// 树复用：把 root 提升到落子 move 对应的子节点。失败返回 None。
     pub fn find_child(&mut self, mv: (u8, u8)) -> Option<()> {
         if self.root < 0 {
@@ -871,7 +936,7 @@ impl Pool {
         None
     }
 
-    /// 搜索收尾：必胜手优先（stats 直接置该方 100%），否则 UCB1 最优子。
+    /// 求胜时优先立即制胜，再排除允许对手一步制胜的走法；其余使用 UCB1。
     fn finish(&mut self, goal: i32, turn: u8, total: u64) -> Option<(u8, u8)> {
         if goal > 0 {
             if let Some(mv) = self.winning_child(turn) {
@@ -884,7 +949,11 @@ impl Pool {
                 return Some(mv);
             }
         }
-        self.best_move()
+        if goal > 0 {
+            self.safe_move(turn).or_else(|| self.best_move())
+        } else {
+            self.best_move()
+        }
     }
 
     /// 单树搜索（树复用 + 容量管理 + 批次时间检查）。
@@ -1100,11 +1169,16 @@ fn search_parallel_with_cancel(
     }
 
     // 合并选步：各树同 move 子节点总访问数最大者
+    let has_safe_move = goal > 0 && main.safe_move(pos.turn).is_some();
     let mut best_mv: Option<(u8, u8)> = None;
     let mut best_visits: i64 = -1;
     let mut ch = main.first_child[main.root as usize];
     while ch >= 0 {
         let c = ch as usize;
+        if has_safe_move && main.allows_immediate_loss(c, pos.turn) {
+            ch = main.next_sib[c];
+            continue;
+        }
         let sub = main.mv_sub[c];
         let cell = main.mv_cell[c];
         let mut v = main.visits[c] as i64;
@@ -1296,7 +1370,7 @@ mod tests {
 
     #[test]
     fn tree_reuse_and_find_child() {
-        let mut p = Pool::new(65_536);
+        let mut p = Pool::new(NODE_CAP);
         let mut g = crate::engine::Game::new();
         assert!(g.apply_move(0, 0));
         let flat: Vec<u8> = g.cells.iter().flat_map(|r| r.iter().copied()).collect();
@@ -1314,7 +1388,7 @@ mod tests {
         let mv2 = p.search(&pos, 1, 2_000, 0.0);
         assert!(mv2.is_some());
         // 复用真实生效：传入的根节点统计被继续使用（visits 增长）
-        assert!(p.visits[p.root as usize] > visits_before);
+        assert_eq!(p.visits[p.root as usize], visits_before + 2_000);
     }
 
     #[test]
@@ -1358,6 +1432,115 @@ mod tests {
             let r = p.rollout(0, 1);
             assert!(r == -1 || r == 0 || r == 1, "reward out of domain: {r}");
         }
+    }
+
+    #[test]
+    fn avoids_a_real_one_move_loss_at_novice_budget() {
+        let mut game = crate::engine::Game::new();
+        for step in include_str!("../../tests/fixtures/avoid_immediate_loss.txt")
+            .trim()
+            .split(';')
+        {
+            let (sub, cell) = step.split_once(',').unwrap();
+            assert!(game.apply_move(sub.parse().unwrap(), cell.parse().unwrap()));
+        }
+        let flat: Vec<_> = game.cells.iter().flatten().copied().collect();
+        let pos = Pos::from_flat(&flat, &game.grids, game.forced, game.turn);
+        let mut pool = Pool::with_seed(NODE_CAP, 8_820_990_395_033_202_828);
+        let selected = pool.search(&pos, 1, 2_000, 0.0).unwrap();
+        let previous = pool.best_move().unwrap();
+        assert_eq!(previous, (5, 6));
+        assert_eq!(selected, (5, 0));
+        let opponent_can_win = |mv: (u8, u8)| {
+            let mut after = game;
+            assert!(after.apply_move(mv.0 as usize, mv.1 as usize));
+            after.legal_moves().into_iter().any(|reply| {
+                let mut end = after;
+                assert!(end.apply_move(reply.0 as usize, reply.1 as usize));
+                end.winner == 3 - game.turn
+            })
+        };
+        assert!(opponent_can_win(previous));
+        assert!(!opponent_can_win(selected));
+    }
+
+    #[test]
+    fn immediate_loss_guard_matches_rules_on_random_games() {
+        let mut rng = 907_202_609u64;
+        let mut pool = Pool::with_seed(128, 123);
+        let mut checked = 0;
+        let mut threats = 0;
+        for _ in 0..200 {
+            let mut game = crate::engine::Game::new();
+            while !game.is_over() {
+                let flat: Vec<_> = game.cells.iter().flatten().copied().collect();
+                let pos = Pos::from_flat(&flat, &game.grids, game.forced, game.turn);
+                pool.recycle();
+                pool.new_root(&pos);
+                let legal = game.legal_moves();
+                for _ in &legal {
+                    let slot = pool.free;
+                    pool.free += 1;
+                    let child = pool.expand(0, slot);
+                    let mv = (pool.mv_sub[child], pool.mv_cell[child]);
+                    let mut after = game;
+                    assert!(after.apply_move(mv.0 as usize, mv.1 as usize));
+                    let expected = after.legal_moves().into_iter().any(|reply| {
+                        let mut end = after;
+                        assert!(end.apply_move(reply.0 as usize, reply.1 as usize));
+                        end.winner == 3 - game.turn
+                    });
+                    assert_eq!(pool.allows_immediate_loss(child, game.turn), expected);
+                    checked += 1;
+                    threats += usize::from(expected);
+                }
+                rng = xs64(rng);
+                let mv = legal[rng as usize % legal.len()];
+                assert!(game.apply_move(mv.0 as usize, mv.1 as usize));
+            }
+        }
+        assert!(checked > 50_000 && threats > 100);
+    }
+
+    #[test]
+    fn safe_selection_blocks_an_avoidable_macro_loss_and_keeps_other_goals() {
+        // O must avoid sending X to sub-board 8, where X can win the macro line.
+        // Cell 7 instead forces X into a safe board; the threat is above bit 64.
+        let mut cells = [0u8; 81];
+        cells[8 * 9] = 2;
+        cells[8 * 9 + 1] = 2;
+        let mut grids = [0u8; 9];
+        grids[2] = 2;
+        grids[5] = 2;
+        let pos = Pos::from_flat(&cells, &grids, 0, 1);
+        let mut pool = Pool::with_seed(128, 42);
+        pool.new_root(&pos);
+        pool.visits[0] = 90;
+        for _ in 0..9 {
+            let slot = pool.free;
+            pool.free += 1;
+            let c = pool.expand(0, slot);
+            pool.visits[c] = 10;
+            pool.quality[c] = match pool.mv_cell[c] {
+                8 => 9.0,
+                7 => 8.0,
+                _ => 0.0,
+            };
+        }
+        assert_eq!(pool.best_move(), Some((0, 8)));
+        assert_eq!(pool.finish(1, 1, 90), Some((0, 7)));
+        assert_eq!(pool.finish(-1, 1, 90), Some((0, 8)));
+        // If every expanded move loses immediately, retain the original choice.
+        for c in 1..pool.free {
+            pool.forced[c] = 8;
+        }
+        assert_eq!(pool.finish(1, 1, 90), Some((0, 8)));
+        // A won game takes precedence even if other boards contain threats.
+        pool.grids[1] = [1, 1, 1, 0, 0, 0, 0, 0, 0];
+        assert_eq!(
+            pool.finish(1, 1, 90),
+            Some((pool.mv_sub[1], pool.mv_cell[1]))
+        );
     }
 
     #[test]

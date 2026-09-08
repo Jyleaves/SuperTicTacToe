@@ -24,8 +24,7 @@ WebView2 用户数据保存在应用旁的运行时数据目录；该目录不�
 安装 Rust MSVC 工具链和 Visual Studio C++ 构建工具，在仓库根目录执行：
 
 ```powershell
-.
-ustuild.cmd
+.\rust\build.cmd
 ```
 
 产物是根目录的 `SuperTicTacToe.exe` 和 `super_ttt/sttt.dll`。脚本固定产物目录、检查构建及复制结果，映射本机源码路径并移除调试符号；DLL 与 EXE 使用相同的 Release 配置。
@@ -47,8 +46,7 @@ python main.py
 
 ```powershell
 python -m pip install -r requirements.txt numpy numba
-.
-ustuild.cmd
+.\rust\build.cmd
 cargo test --release --locked --manifest-path rust/Cargo.toml
 cargo test --release --locked --features portable --manifest-path rust/Cargo.toml
 node --test tests/test_frontend.cjs
@@ -63,9 +61,9 @@ python tests/smoke_gui.py
 ## 性能
 
 AI 保持单树搜索与树复用；后台评估只保留最新任务，AI 选步期间暂停评估。
-模拟初始化使用 1 KiB 缺口表，节点池按工作量分配。前端复用棋盘节点，仅更新改变的棋子样式。
+模拟初始化使用 1 KiB 缺口表；AI 保持原有节点容量，显示用评估池按工作量分配。前端复用棋盘节点，仅更新改变的棋子样式。
 
-测量条件、原项目 / 修正包 / 最终版对照与局限见 [PROGRESS.md](PROGRESS.md)。固定随机种子的结果一致性不等于棋力提升；本次没有修改搜索策略或难度档位。
+测量条件、原项目 / 修正包 / 最终版对照与局限见 [PROGRESS.md](PROGRESS.md)。求胜模式优先直接制胜，并在存在安全走法时排除允许对手下一步直接获胜的落子。难度和树内搜索策略保持不变；尚无足够对弈证据宣称整体棋力提升。
 
 ```powershell
 python tests/bench_dll.py
@@ -75,6 +73,21 @@ python tests/bench_session.py super_ttt/sttt.dll
 
 最后一个脚本测量搜索期间的状态查询延迟及 Python/DLL 进程工作集。CPU 核心绑定仅用于可重复基准，不改变应用调度。
 EXE 自带 `--bench-engine`、`?bench`、`?startup` 诊断入口，分别生成引擎、桥延迟和启动计时文件；这些本地结果不纳入版本控制。
+
+## 棋力对照
+
+对弈脚本使用多种随机种子、0 / 8 / 16 / 24 手合法开局，并交换双方颜色；两方都复用搜索树。
+胜计 1 分、和计 0.5 分，结果包含按开局配对重采样的区间。固定种子便于重放，不代表每局重复。
+
+```powershell
+git fetch --tags
+python tests/duel_versions.py --reference v1.1.0 --games 160 --iterations 8000 --seed 60101 --cpu 0 --output target/strength.jsonl
+```
+
+使用 `--time-ms 12 --iterations 2000000` 可测等时间预算；计时以 512 次迭代为一批，会有超时量。
+默认对照 v1.1.0 的自适应节点池；对照 v1.0.0 时增加 `--reference-pool full`。
+脚本直接测试 Rust 搜索，不包含窗口、后台胜率评估或随机种子的时间来源。
+它输出每局种子、棋谱与汇总；胜率和区间只适用于所测开局与预算。
 
 ## 目录
 
