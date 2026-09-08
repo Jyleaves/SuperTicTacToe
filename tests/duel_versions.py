@@ -30,13 +30,16 @@ def paired_interval(rows):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--reference', default='v1.1.0')
+    parser.add_argument('--reference', default='v1.1.1')
     parser.add_argument('--games', type=int, default=120)
     parser.add_argument('--iterations', type=int, default=8000)
     parser.add_argument('--time-ms', type=float, default=0,
                         help='per-move budget; 0 runs all iterations')
     parser.add_argument('--seed', type=int, default=20260908)
-    parser.add_argument('--reference-pool', choices=['full', 'adaptive'], default='adaptive',
+    parser.add_argument('--goal', type=int, choices=[1, -1], default=1)
+    parser.add_argument('--threads', type=int, default=1)
+    parser.add_argument('--portable', action='store_true', help='force both software CPU kernels')
+    parser.add_argument('--reference-pool', choices=['full', 'adaptive'], default='full',
                         help='v1.1.0 used adaptive pools; v1.0.0 uses full')
     parser.add_argument('--candidate-pool', choices=['full', 'adaptive'], default='full')
     parser.add_argument('--cpu', type=int)
@@ -48,24 +51,31 @@ def main():
         parser.error('--games must be positive and even')
     if not 1 <= args.iterations <= 2_000_000:
         parser.error('--iterations must be in 1..2000000')
+    if not 1 <= args.threads <= 32:
+        parser.error('--threads must be in 1..32')
     if not math.isfinite(args.time_ms) or args.time_ms < 0:
         parser.error('--time-ms must be finite and nonnegative')
     if not 0 <= args.seed < 2**64:
         parser.error('--seed must be a u64')
     if args.equivalence and args.time_ms:
         parser.error('deterministic equivalence requires an iteration budget')
+    if args.goal == -1 and not args.equivalence:
+        parser.error("--goal -1 is supported in --equivalence mode")
     revision = subprocess.check_output(
         ['git', 'rev-parse', '--verify', '--end-of-options', args.reference + '^{commit}'],
         cwd=ROOT, text=True).strip()
     reference = subprocess.check_output(
         ['git', 'show', revision + ':rust/src/mcts.rs'], cwd=ROOT)
     candidate = (ROOT / 'rust/src/mcts.rs').read_bytes()
+    if args.portable and b'feature = "portable"' not in reference:
+        parser.error('reference does not implement the portable feature')
     capacity = lambda kind: 524288 if kind == 'full' else min(524288, 65536 + 2 * args.iterations)
     config = dict(type='configuration', reference=revision,
                   candidate_sha256=hashlib.sha256(candidate).hexdigest(),
                   games=args.games, iterations=args.iterations, time_ms=args.time_ms,
                   seed=args.seed, cpu=args.cpu, reference_pool=args.reference_pool,
-                  candidate_pool=args.candidate_pool, equivalence=args.equivalence,
+                  candidate_pool=args.candidate_pool, goal=args.goal, portable=args.portable,
+                  threads=args.threads, equivalence=args.equivalence,
                   rustc=subprocess.check_output(['rustc', '--version'], text=True).strip())
     args.output.parent.mkdir(parents=True, exist_ok=True)
     # Generated absolute include paths stay in the temporary directory only.
@@ -80,6 +90,8 @@ def main():
             'include!("match.rs");\n', encoding='utf-8')
         executable = work / ('match.exe' if os.name == 'nt' else 'match')
         command = ['rustc', '--edition', '2021', '-O', '-C', 'panic=abort']
+        if args.portable:
+            command += ['--cfg', 'feature="portable"']
         if os.name == 'nt':
             command += ['-C', 'target-feature=+crt-static']
         subprocess.run(command + ['main.rs', '-o', str(executable)], cwd=work, check=True)
@@ -96,7 +108,7 @@ def main():
         mode = 'equiv' if args.equivalence else 'duel'
         command = [str(executable), mode, str(args.games), str(args.iterations),
                    str(args.time_ms), str(args.seed), str(capacity(args.candidate_pool)),
-                   str(capacity(args.reference_pool))]
+                   str(capacity(args.reference_pool)), str(args.goal), str(args.threads)]
         rows = []
         with args.output.open('w', encoding='utf-8', newline='\n') as output:
             output.write(json.dumps(config) + '\n')
@@ -113,10 +125,11 @@ def main():
                     raise RuntimeError('match runner failed')
             if len(rows) != args.games:
                 raise RuntimeError('incomplete match set')
-            score, interval = paired_interval(rows)
+            score, interval = (None, None) if args.equivalence else paired_interval(rows)
             summary = dict(type='summary', wdl=rows[-1]['wdl'], score=score,
                            paired_bootstrap_95=interval, positions=rows[-1]['positions'],
-                           differences=rows[-1]['differences'])
+                           differences=rows[-1]['differences'],
+                           search_seconds=[sum(r['seconds'][i] for r in rows) for i in range(2)])
             output.write(json.dumps(summary) + '\n')
             print(json.dumps(summary), flush=True)
             if args.equivalence and summary['differences']:

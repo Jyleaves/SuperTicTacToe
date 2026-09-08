@@ -26,13 +26,19 @@ impl AI {
             Self::Candidate(p) => step!(p),
         }
     }
-    fn search(&mut self, g: &Game, iters: u64, budget: f64) -> ((u8, u8), [i64; 3], u64) {
+    fn search(
+        &mut self,
+        g: &Game,
+        iters: u64,
+        budget: f64,
+        goal: i32,
+        threads: usize,
+    ) -> ((u8, u8), [i64; 3], u64) {
         let cells: Vec<_> = g.cells.iter().flatten().copied().collect();
         macro_rules! go {
             ($p:expr,$module:ident) => {{
                 let pos = $module::Pos::from_flat(&cells, &g.grids, g.forced, g.turn);
-                let mv = $p
-                    .search(&pos, 1, iters, budget)
+                let mv = $module::search_dispatch($p, &pos, goal, iters, budget, threads)
                     .expect("nonterminal search must return a move");
                 (mv, $p.stats, $p.done)
             }};
@@ -63,8 +69,8 @@ fn opening(seed: u64, plies: usize) -> Game {
 fn main() {
     let args: Vec<_> = std::env::args().collect();
     assert!(
-        args.len() == 8,
-        "mode games iterations milliseconds seed candidate_capacity reference_capacity"
+        args.len() == 10,
+        "mode games iterations milliseconds seed candidate_capacity reference_capacity goal threads"
     );
     let mode = &args[1];
     let left = "candidate";
@@ -75,11 +81,13 @@ fn main() {
     let seed: u64 = args[5].parse().unwrap();
     let a_cap = args[6].parse().unwrap();
     let b_cap = args[7].parse().unwrap();
+    let goal = args[8].parse().unwrap();
+    let threads = args[9].parse().unwrap();
     let mut totals = [0; 3];
     let mut differences = 0;
     let mut positions = 0;
     for round in 0..games {
-        let pair = round / 2;
+        let pair = if mode == "equiv" { round } else { round / 2 };
         let game_seed = seed.wrapping_add((pair as u64 + 1) * 0x9e3779b9);
         let mut game = opening(game_seed, [0, 8, 16, 24][pair % 4]);
         let a_color = (round % 2 + 1) as u8;
@@ -91,24 +99,29 @@ fn main() {
         let mut plies = 0;
         while game.winner == 0 {
             let index = usize::from(game.turn != a_color);
+            let mut measure = |ai: &mut AI, side: usize| {
+                let now = Instant::now();
+                let result = ai.search(&game, iters, budget, goal, threads);
+                elapsed[side] += now.elapsed().as_secs_f64();
+                done[side] += result.2;
+                result
+            };
             let mv = if mode == "equiv" {
-                let x = a.search(&game, iters, budget);
-                let y = b.search(&game, iters, budget);
+                let (x, y) = if (round + plies) % 2 == 0 {
+                    (measure(&mut a, 0), measure(&mut b, 1))
+                } else {
+                    let y = measure(&mut b, 1);
+                    (measure(&mut a, 0), y)
+                };
                 positions += 1;
                 if x != y {
                     differences += 1;
                 }
                 x.0
+            } else if index == 0 {
+                measure(&mut a, 0).0
             } else {
-                let now = Instant::now();
-                let result = if index == 0 {
-                    a.search(&game, iters, budget)
-                } else {
-                    b.search(&game, iters, budget)
-                };
-                elapsed[index] += now.elapsed().as_secs_f64();
-                done[index] += result.2;
-                result.0
+                measure(&mut b, 1).0
             };
             assert!(
                 game.apply_move(mv.0 as usize, mv.1 as usize),

@@ -61,31 +61,33 @@ python tests/smoke_gui.py
 ## 性能
 
 AI 保持单树搜索与树复用；后台评估只保留最新任务，AI 选步期间暂停评估。
-模拟初始化使用 1 KiB 缺口表；AI 保持原有节点容量，显示用评估池按工作量分配。前端复用棋盘节点，仅更新改变的棋子样式。
+模拟使用共 1.5 KiB 的缺口和胜负查表，节点缓存未展开合法步与终局结果；AI 保持原有节点容量，显示用评估池按工作量分配。前端复用棋盘节点，仅更新改变的棋子样式。
 
 测量条件、原项目 / 修正包 / 最终版对照与局限见 [PROGRESS.md](PROGRESS.md)。求胜模式优先直接制胜，并在存在安全走法时排除允许对手下一步直接获胜的落子。难度和树内搜索策略保持不变；尚无足够对弈证据宣称整体棋力提升。
 
 ```powershell
 python tests/bench_dll.py
 python tests/compare_search.py old.dll new.dll --rounds 7 --cpu 0
+python tests/compare_search.py old.dll new.dll --varied --iters 32000 --rounds 7 --cpu 0
 python tests/bench_session.py super_ttt/sttt.dll
 ```
 
-最后一个脚本测量搜索期间的状态查询延迟及 Python/DLL 进程工作集。CPU 核心绑定仅用于可重复基准，不改变应用调度。
+`--varied` 补充 20 个来自不同阶段的随机合法局面，`--seed` 控制棋谱生成。最后一个脚本测量搜索期间的状态查询延迟及 Python/DLL 进程工作集。CPU 核心绑定仅用于可重复基准，不改变应用调度。
 EXE 自带 `--bench-engine`、`?bench`、`?startup` 诊断入口，分别生成引擎、桥延迟和启动计时文件；这些本地结果不纳入版本控制。
 
-## 棋力对照
+## 搜索一致性与棋力对照
 
-对弈脚本使用多种随机种子、0 / 8 / 16 / 24 手合法开局，并交换双方颜色；两方都复用搜索树。
-胜计 1 分、和计 0.5 分，结果包含按开局配对重采样的区间。固定种子便于重放，不代表每局重复。
+`--equivalence` 使用独立种子生成每条轨迹，在同一局面、相同搜索种子下比较两版落子、统计和迭代数；双方均复用树，任一结果不同即失败。
 
 ```powershell
 git fetch --tags
-python tests/duel_versions.py --reference v1.1.0 --games 160 --iterations 8000 --seed 60101 --cpu 0 --output target/strength.jsonl
+python tests/duel_versions.py --reference v1.1.1 --games 16 --iterations 8000 --seed 90101 --cpu 0 --equivalence --output target/search-equivalence.jsonl
 ```
 
-使用 `--time-ms 12 --iterations 2000000` 可测等时间预算；计时以 512 次迭代为一批，会有超时量。
-默认对照 v1.1.0 的自适应节点池；对照 v1.0.0 时增加 `--reference-pool full`。
+`--goal -1` 验证求败模式，`--portable` 强制软件路径，`--threads 4` 验证多线程。
+去掉 `--equivalence` 可进行交换颜色的对弈；胜计 1 分、和计 0.5 分，并按开局配对重采样计算区间。
+对弈模式增加 `--time-ms 12 --iterations 2000000` 可测等时间预算；每 512 次迭代检查时间，会有超时量。
+默认使用 v1.1.1 的完整节点池；对照 v1.1.0 时增加 `--reference-pool adaptive`。
 脚本直接测试 Rust 搜索，不包含窗口、后台胜率评估或随机种子的时间来源。
 它输出每局种子、棋谱与汇总；胜率和区间只适用于所测开局与预算。
 

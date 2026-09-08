@@ -89,6 +89,14 @@ jobs:
       - name: Install Python deps
         run: pip install pywebview numpy numba
 
+      - name: Seeded search equivalence against v1.1.1
+        run: |
+          git fetch --no-tags --depth=1 origin refs/tags/v1.1.1:refs/tags/v1.1.1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tests/duel_versions.py --reference v1.1.1 --games 4 --iterations 8000 --seed 20260910 --equivalence --output target/search-equivalence.jsonl
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tests/duel_versions.py --reference v1.1.1 --games 4 --iterations 2000 --seed 20260911 --goal -1 --portable --threads 4 --equivalence --output target/search-equivalence-portable.jsonl
+
       - name: Python unit tests (headless)
         run: python -m unittest discover -s tests -p 'test_*.py' -v
 
@@ -112,3 +120,4 @@ jobs:
             rust/app/target/release/sttt-app.exe
             rust/target/release/sttt.dll
             bench_engine_result.json
+            target/search-equivalence*.jsonl

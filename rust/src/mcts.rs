@@ -146,6 +146,25 @@ const fn build_gap_table() -> [u16; 512] {
 }
 const GAP_TABLE: [u16; 512] = build_gap_table();
 
+const fn build_won_table() -> [bool; 512] {
+    let mut table = [false; 512];
+    let mut own = 0usize;
+    while own < 512 {
+        let mut line = 0;
+        while line < 8 {
+            let [a, b, c] = crate::engine::WIN_LINES[line];
+            let mask = (1 << a) | (1 << b) | (1 << c);
+            if own & mask == mask {
+                table[own] = true;
+            }
+            line += 1;
+        }
+        own += 1;
+    }
+    table
+}
+const WON_TABLE: [bool; 512] = build_won_table();
+
 #[inline(always)]
 fn initial_gaps(c0: u64, c1: u64, x0: u64, x1: u64, open: u16) -> (u64, u64, u64, u64) {
     let circles = c0 as u128 | ((c1 as u128) << 64);
@@ -212,14 +231,15 @@ fn accelerated_cpu() -> bool {
 }
 
 /// 掩码内第 k 个置位的位号（调用方保证 k < popcount）。
-/// x86_64 + BMI2：pdep 单指令（把 1<<k 押到 x 的第 k 个置位上）；
+/// x86_64 + BMI2：批次入口选择 pdep 路径，循环内不再检测 CPU；
 /// 否则回退循环清位。
 #[inline(always)]
-fn kth64(x: u64, k: u64) -> usize {
+fn kth64<const USE_BMI2: bool>(x: u64, k: u64) -> usize {
     #[cfg(target_arch = "x86_64")]
     {
-        if bmi2() {
-            // SAFETY: bmi2 已探测；k < popcount(x) ≤ 64 由调用方保证
+        if USE_BMI2 {
+            // SAFETY: the batch dispatcher checked BMI2 before selecting this
+            // specialization; k < popcount(x) <= 64 is guaranteed by the caller.
             let bit = unsafe { std::arch::x86_64::_pdep_u64(1u64 << k, x) };
             debug_assert!(bit != 0);
             return bit.trailing_zeros() as usize;
@@ -255,12 +275,12 @@ fn mul_hi(rng: u64, n: u64) -> u64 {
 
 /// (w0,w1) 两段掩码内第 k 个置位的位号（调用方保证 k < pop2）
 #[inline(always)]
-fn kth_bit(w0: u64, w1: u64, k: u64) -> usize {
+fn kth_bit<const USE_BMI2: bool>(w0: u64, w1: u64, k: u64) -> usize {
     let n0 = w0.count_ones() as u64;
     if k < n0 {
-        kth64(w0, k)
+        kth64::<USE_BMI2>(w0, k)
     } else {
-        64 + kth64(w1, k - n0)
+        64 + kth64::<USE_BMI2>(w1, k - n0)
     }
 }
 
@@ -340,10 +360,11 @@ pub struct Pool {
     x0: Vec<u64>,
     x1: Vec<u64>,
     grids: Vec<[u8; 9]>,
+    // Immutable node positions need their terminal result computed only once.
+    outcome: Vec<u8>,
     forced: Vec<i8>,
     turn: Vec<u8>,
-    // 树结构：头插链表（消融实验 E1 证实 arena 连续布局因内存足迹膨胀
-    // 反而慢 40-60%，链表的时间局部性已足够——见 PROGRESS.md 消融表）
+    // 树结构：头插链表，保持原有展开及遍历顺序。
     parent: Vec<i32>,
     first_child: Vec<i32>,
     next_sib: Vec<i32>,
@@ -352,8 +373,7 @@ pub struct Pool {
     quality: Vec<f64>,
     mv_sub: Vec<u8>,
     mv_cell: Vec<u8>,
-    legal_count: Vec<i32>,
-    n_children: Vec<i32>,
+    // Remaining unexpanded legal moves; clear one bit per expansion.
     bm0: Vec<u64>,
     bm1: Vec<u64>,
     // 搜索产物
@@ -377,6 +397,7 @@ impl Pool {
             x0: vec![0; cap],
             x1: vec![0; cap],
             grids: vec![[0; 9]; cap],
+            outcome: vec![0; cap],
             forced: vec![-1; cap],
             turn: vec![0; cap],
             parent: vec![-1; cap],
@@ -386,8 +407,6 @@ impl Pool {
             quality: vec![0.0; cap],
             mv_sub: vec![u8::MAX; cap],
             mv_cell: vec![u8::MAX; cap],
-            legal_count: vec![0; cap],
-            n_children: vec![0; cap],
             bm0: vec![0; cap],
             bm1: vec![0; cap],
             stats: [0; 3],
@@ -422,6 +441,7 @@ impl Pool {
         self.x0[i] = pos.x0;
         self.x1[i] = pos.x1;
         self.grids[i] = pos.grids;
+        self.outcome[i] = big_winner(&pos.grids);
         self.forced[i] = pos.forced;
         self.turn[i] = pos.turn;
         self.parent[i] = -1;
@@ -431,9 +451,6 @@ impl Pool {
         self.quality[i] = 0.0;
         self.mv_sub[i] = u8::MAX;
         self.mv_cell[i] = u8::MAX;
-        self.n_children[i] = 0;
-        self.bm0[i] = 0;
-        self.bm1[i] = 0;
         let (l0, l1) = legal_masks(
             pos.c0,
             pos.c1,
@@ -442,7 +459,8 @@ impl Pool {
             open_pattern(&pos.grids),
             pos.forced,
         );
-        self.legal_count[i] = pop2(l0, l1) as i32;
+        self.bm0[i] = l0;
+        self.bm1[i] = l1;
         self.root = i as i32;
     }
 
@@ -450,29 +468,21 @@ impl Pool {
     /// slot 由调用方在自增前取出（Python 版语义：free_arr[0]-1），
     /// 与池容量边界严格隔离。
     #[inline]
-    fn expand(&mut self, node: usize, slot: usize) -> usize {
+    fn expand<const USE_BMI2: bool>(&mut self, node: usize, slot: usize) -> usize {
         let free = slot;
         debug_assert!(free < self.cap);
 
-        let (l0, l1) = legal_masks(
-            unsafe { *self.c0.get_unchecked(node) },
-            unsafe { *self.c1.get_unchecked(node) },
-            unsafe { *self.x0.get_unchecked(node) },
-            unsafe { *self.x1.get_unchecked(node) },
-            open_pattern(unsafe { self.grids.get_unchecked(node) }),
-            unsafe { *self.forced.get_unchecked(node) },
-        );
-        let a0 = l0 & !unsafe { *self.bm0.get_unchecked(node) };
-        let a1 = l1 & !unsafe { *self.bm1.get_unchecked(node) };
+        let a0 = unsafe { *self.bm0.get_unchecked(node) };
+        let a1 = unsafe { *self.bm1.get_unchecked(node) };
         let remaining = pop2(a0, a1);
         debug_assert!(remaining > 0);
         self.rng = xs64(self.rng);
         let k = mul_hi(self.rng, remaining);
-        let pick = kth_bit(a0, a1, k);
+        let pick = kth_bit::<USE_BMI2>(a0, a1, k);
         if pick < 64 {
-            self.bm0[node] |= 1u64 << pick;
+            self.bm0[node] &= !(1u64 << pick);
         } else {
-            self.bm1[node] |= 1u64 << (pick - 64);
+            self.bm1[node] &= !(1u64 << (pick - 64));
         }
 
         // 拷贝父局面 + 落子
@@ -538,11 +548,9 @@ impl Pool {
         self.first_child[free] = -1;
         self.next_sib[free] = self.first_child[node];
         self.first_child[node] = free as i32;
-        self.n_children[node] += 1;
-        self.n_children[free] = 0;
-        self.bm0[free] = 0;
-        self.bm1[free] = 0;
         let g = self.grids[free];
+        // The parent was nonterminal. Only a newly closed sub-board can end it.
+        self.outcome[free] = if g[sub] != 0 { big_winner(&g) } else { 0 };
         let f = self.forced[free];
         let (cl0, cl1) = legal_masks(
             self.c0[free],
@@ -552,26 +560,27 @@ impl Pool {
             open_pattern(&g),
             f,
         );
-        self.legal_count[free] = pop2(cl0, cl1) as i32;
+        self.bm0[free] = cl0;
+        self.bm1[free] = cl1;
         free
     }
 
     /// 从 root 下行：有未展开合法步则展开（容量满则返回当前节点），
     /// 否则 UCB1 选子，直到终局节点。返回叶节点索引。
     #[inline]
-    fn tree_policy(&mut self, root: usize) -> usize {
+    fn tree_policy<const USE_BMI2: bool>(&mut self, root: usize) -> usize {
         let mut node = root;
         loop {
-            if big_winner(unsafe { self.grids.get_unchecked(node) }) != 0 {
+            if unsafe { *self.outcome.get_unchecked(node) } != 0 {
                 return node;
             }
-            let lc = unsafe { *self.legal_count.get_unchecked(node) } as usize;
-            let nc = unsafe { *self.n_children.get_unchecked(node) } as usize;
-            if nc < lc {
+            let remaining =
+                unsafe { *self.bm0.get_unchecked(node) | *self.bm1.get_unchecked(node) };
+            if remaining != 0 {
                 if self.free < self.cap {
                     let slot = self.free; // 槽位必须在自增前取出（边界语义同 Python free_arr[0]-1）
                     self.free += 1;
-                    return self.expand(node, slot);
+                    return self.expand::<USE_BMI2>(node, slot);
                 }
                 return node; // 容量满：不再展开，直接 rollout
             }
@@ -619,10 +628,10 @@ impl Pool {
 
     /// njit 版 _mcts_batch 等价：batch 次迭代 + 终局分布统计。
     #[inline(always)]
-    fn mcts_batch(&mut self, root: usize, goal: i32, batch: usize) {
+    fn mcts_batch<const USE_BMI2: bool>(&mut self, root: usize, goal: i32, batch: usize) {
         for _ in 0..batch {
-            let node = self.tree_policy(root);
-            let w = big_winner(unsafe { self.grids.get_unchecked(node) });
+            let node = self.tree_policy::<USE_BMI2>(root);
+            let w = unsafe { *self.outcome.get_unchecked(node) };
             let reward = if w != 0 {
                 match w {
                     1 => self.stats[0] += 1,
@@ -637,7 +646,7 @@ impl Pool {
             } else {
                 // P5 约定：rollout 返回 +goal 当行动方（mover）落败
                 let mover = unsafe { *self.turn.get_unchecked(node) };
-                let r = self.rollout(node, goal);
+                let r = self.rollout::<USE_BMI2>(node, goal);
                 if r == -goal {
                     if mover == 1 {
                         self.stats[0] += 1
@@ -659,10 +668,10 @@ impl Pool {
         }
     }
 
-    /// greedy-1 位板 rollout（Python _rollout_bb_g 的逐行移植）。
+    /// greedy-1 位板 rollout，保持 Python 参照算法的模拟策略。
     /// 增量维护"差一格成线"缺口集：立即赢 → 防立即输 → 随机。
     #[inline(always)]
-    fn rollout(&mut self, node: usize, goal: i32) -> i32 {
+    fn rollout<const USE_BMI2: bool>(&mut self, node: usize, goal: i32) -> i32 {
         let mut c0 = unsafe { *self.c0.get_unchecked(node) };
         let mut c1 = unsafe { *self.c1.get_unchecked(node) };
         let mut x0 = unsafe { *self.x0.get_unchecked(node) };
@@ -718,11 +727,11 @@ impl Pool {
             let nw = pop2(w0, w1);
             let nd = pop2(d0, d1);
             let pick = if !late && nw > 0 {
-                kth_bit(w0, w1, mul_hi(rng, nw))
+                kth_bit::<USE_BMI2>(w0, w1, mul_hi(rng, nw))
             } else if !late && nd > 0 {
-                kth_bit(d0, d1, mul_hi(rng, nd))
+                kth_bit::<USE_BMI2>(d0, d1, mul_hi(rng, nd))
             } else {
-                kth_bit(legal0, legal1, mul_hi(rng, n))
+                kth_bit::<USE_BMI2>(legal0, legal1, mul_hi(rng, n))
             };
             let sub = pick / 9;
             let cell = pick % 9;
@@ -738,26 +747,21 @@ impl Pool {
             } else {
                 x1 |= 1u64 << (pick - 64);
             }
-            // me* = 行动方石子，op* = 对方（本步内所有线检查共用，无 turn 分支）
-            let (me0, me1, op0, op1) = if turn == 1 {
-                (c0, c1, x0, x1)
+            // Local pattern lookup replaces up to four 81-bit line scans.
+            // OR-ing all current gaps is equivalent to adding only changed lines;
+            // stale occupied/closed-board bits are filtered by the legal mask.
+            let mine = if turn == 1 {
+                c0 as u128 | (c1 as u128) << 64
             } else {
-                (x0, x1, c0, c1)
+                x0 as u128 | (x1 as u128) << 64
             };
-            // 更新缺口集 + 小格判定（同一 <=4 线循环；empty 为落子前的值，与 Python 一致）
-            let mut w = 0u8;
-            let nlines = CELL_LINE_COUNT[cell];
-            for &(m0, m1) in LINE_MASK[sub][cell].iter().take(nlines) {
-                let n_me = pop2(me0 & m0, me1 & m1);
-                let n_op = pop2(op0 & m0, op1 & m1);
-                if !late && n_me == 2 && n_op == 0 {
-                    mover_gap0 |= empty0 & m0;
-                    mover_gap1 |= empty1 & m1;
-                }
-                if (me0 & m0) == m0 && (me1 & m1) == m1 {
-                    w = turn;
-                }
+            let pattern = ((mine >> (sub * 9)) & 511) as usize;
+            if !late {
+                let gaps = (GAP_TABLE[pattern] as u128) << (sub * 9);
+                mover_gap0 |= (gaps as u64) & empty0;
+                mover_gap1 |= ((gaps >> 64) as u64) & empty1;
             }
+            let w = if WON_TABLE[pattern] { turn } else { 0 };
             if w != 0 {
                 grids[sub] = turn;
                 decided += 1;
@@ -831,7 +835,7 @@ impl Pool {
         let mut ch = self.first_child[root];
         while ch >= 0 {
             let c = ch as usize;
-            if big_winner(&self.grids[c]) == turn {
+            if self.outcome[c] == turn {
                 return Some((self.mv_sub[c], self.mv_cell[c]));
             }
             ch = self.next_sib[c];
@@ -843,7 +847,7 @@ impl Pool {
     fn allows_immediate_loss(&self, child: usize, turn: u8) -> bool {
         let opponent = 3 - turn;
         let grids = &self.grids[child];
-        if big_winner(grids) != 0 {
+        if self.outcome[child] != 0 {
             return false;
         }
         let mut won = 0usize;
@@ -1023,13 +1027,13 @@ impl Pool {
             }
             return;
         }
-        self.mcts_batch(root, goal, batch);
+        self.mcts_batch::<false>(root, goal, batch);
     }
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "popcnt,bmi2,lzcnt")]
     unsafe fn accelerated_batch(&mut self, root: usize, goal: i32, batch: usize) {
-        self.mcts_batch(root, goal, batch);
+        self.mcts_batch::<true>(root, goal, batch);
     }
 
     /// 并行 worker（从树）：重置后独立随机流跑 per 次迭代。
@@ -1247,6 +1251,14 @@ mod tests {
     }
 
     #[test]
+    fn won_lookup_matches_rules_exhaustively() {
+        for (pattern, &won) in WON_TABLE.iter().enumerate() {
+            let cells = std::array::from_fn(|i| ((pattern >> i) & 1) as u8);
+            assert_eq!(won, crate::engine::line_winner(&cells).0 != 0);
+        }
+    }
+
+    #[test]
     fn gap_lookup_matches_line_scan_exhaustively() {
         for own in 0u16..512 {
             for opponent in 0u16..512 {
@@ -1326,7 +1338,12 @@ mod tests {
         for _ in 0..2000 {
             word = xs64(word);
             for k in 0..word.count_ones() as u64 {
-                assert_eq!(kth64(word, k), kth64_loop(word, k));
+                let expected = kth64_loop(word, k);
+                assert_eq!(kth64::<false>(word, k), expected);
+                #[cfg(target_arch = "x86_64")]
+                if bmi2() {
+                    assert_eq!(kth64::<true>(word, k), expected);
+                }
             }
         }
     }
@@ -1429,7 +1446,7 @@ mod tests {
         p.recycle();
         p.new_root(&pos);
         for _ in 0..200 {
-            let r = p.rollout(0, 1);
+            let r = p.rollout::<false>(0, 1);
             assert!(r == -1 || r == 0 || r == 1, "reward out of domain: {r}");
         }
     }
@@ -1478,13 +1495,18 @@ mod tests {
                 pool.recycle();
                 pool.new_root(&pos);
                 let legal = game.legal_moves();
+                let mut expanded = [false; 81];
                 for _ in &legal {
                     let slot = pool.free;
                     pool.free += 1;
-                    let child = pool.expand(0, slot);
+                    let child = pool.expand::<false>(0, slot);
                     let mv = (pool.mv_sub[child], pool.mv_cell[child]);
+                    let index = mv.0 as usize * 9 + mv.1 as usize;
+                    assert!(!expanded[index], "duplicate child");
+                    expanded[index] = true;
                     let mut after = game;
                     assert!(after.apply_move(mv.0 as usize, mv.1 as usize));
+                    assert_eq!(pool.outcome[child], after.winner);
                     let expected = after.legal_moves().into_iter().any(|reply| {
                         let mut end = after;
                         assert!(end.apply_move(reply.0 as usize, reply.1 as usize));
@@ -1494,6 +1516,7 @@ mod tests {
                     checked += 1;
                     threats += usize::from(expected);
                 }
+                assert_eq!(pool.bm0[0] | pool.bm1[0], 0);
                 rng = xs64(rng);
                 let mv = legal[rng as usize % legal.len()];
                 assert!(game.apply_move(mv.0 as usize, mv.1 as usize));
@@ -1519,7 +1542,7 @@ mod tests {
         for _ in 0..9 {
             let slot = pool.free;
             pool.free += 1;
-            let c = pool.expand(0, slot);
+            let c = pool.expand::<false>(0, slot);
             pool.visits[c] = 10;
             pool.quality[c] = match pool.mv_cell[c] {
                 8 => 9.0,
@@ -1537,6 +1560,7 @@ mod tests {
         assert_eq!(pool.finish(1, 1, 90), Some((0, 8)));
         // A won game takes precedence even if other boards contain threats.
         pool.grids[1] = [1, 1, 1, 0, 0, 0, 0, 0, 0];
+        pool.outcome[1] = 1;
         assert_eq!(
             pool.finish(1, 1, 90),
             Some((pool.mv_sub[1], pool.mv_cell[1]))

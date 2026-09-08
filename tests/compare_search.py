@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from tests.bench_positions import positions
+from tests.bench_positions import positions, varied_positions
 
 
 def load(path):
@@ -32,6 +32,8 @@ def main():
     parser.add_argument('--rounds', type=int, default=7)
     parser.add_argument('--iters', type=int, default=128000)
     parser.add_argument('--threads', type=int, default=1)
+    parser.add_argument('--varied', action='store_true', help='20 additional seeded legal positions')
+    parser.add_argument('--seed', type=int, default=20260909)
     parser.add_argument('--cpu', type=int, help='pin this benchmark process to one logical CPU')
     args = parser.parse_args()
     if args.cpu is not None:
@@ -43,7 +45,8 @@ def main():
         else:
             os.sched_setaffinity(0, {args.cpu})
     libs = [load(path) for path in args.dll]
-    for name, game in positions():
+    fixtures = positions() + (varied_positions(args.seed) if args.varied else [])
+    for name, game in fixtures:
         cells = (ctypes.c_int8 * 81)(*(c for row in game.cells for c in row))
         grids = (ctypes.c_int8 * 9)(*game.grids)
         samples = [[] for _ in libs]
@@ -63,6 +66,7 @@ def main():
         for i, rows in enumerate(samples):
             print(json.dumps(dict(library=Path(args.dll[i]).name, position=name,
                                   threads=args.threads, iters=args.iters,
+                                  seed=args.seed if args.varied else None,
                                   rounds=args.rounds,
                                   search_ms=round(statistics.median(r[0] for r in rows), 3),
                                   wall_ms=round(statistics.median(r[1] for r in rows), 3))))
